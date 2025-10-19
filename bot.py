@@ -24,6 +24,21 @@ RSI_SLOW = int(os.getenv("RSI_SLOW", 100))
 # Cliente Binance Futures
 # -----------------------
 client = Client(API_KEY, API_SECRET)
+# === CONFIGURACIÓN DE APALANCAMIENTO ===
+from binance.exceptions import BinanceAPIException
+
+SYMBOL = os.getenv("SYMBOL", "BNBUSDT")  # o tu símbolo desde variables de entorno
+LEVERAGE = int(os.getenv("LEVERAGE", 10))  # puedes definirlo en Railway como LEVERAGE=10
+
+try:
+    # Cambiar apalancamiento del par
+    response = client.futures_change_leverage(
+        symbol=SYMBOL,
+        leverage=LEVERAGE
+    )
+    print(f"✅ Apalancamiento establecido en {LEVERAGE}x para {SYMBOL}")
+except BinanceAPIException as e:
+    print(f"⚠️ Error al establecer apalancamiento: {e}")
 
 # -----------------------
 # Helpers: obtener velas (futuros) y formatear dataframe
@@ -147,3 +162,4 @@ if __name__ == "__main__":
             print("No hay señales en este ciclo")
 
         time.sleep(SLEEP_SECONDS)
+
