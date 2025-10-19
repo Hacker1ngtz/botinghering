@@ -10,7 +10,7 @@ from binance.exceptions import BinanceAPIException
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
 TRADE_AMOUNT = float(os.getenv("TRADE_AMOUNT", 4))  # monto de prueba
-SYMBOL = os.getenv("SYMBOL", "WALUSDT")            # par WAL/USDT
+SYMBOL = os.getenv("SYMBOL", "BTCUSDT")            # par WAL/USDT
 USE_TESTNET = os.getenv("USE_TESTNET", "True") == "True"
 
 # =====================
@@ -144,3 +144,4 @@ if __name__ == "__main__":
         else:
             print("Error obteniendo datos, reintentando en 60s")
         time.sleep(60)
+
