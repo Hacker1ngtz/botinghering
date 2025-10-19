@@ -10,7 +10,6 @@ from binance.exceptions import BinanceAPIException
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
 SYMBOL = os.getenv("SYMBOL")                  # ejemplo: ETHUSDT
-TRADE_QUANTITY = float(os.getenv("TRADE_QUANTITY"))  # cantidad en contratos/base asset
 SLEEP_SECONDS = int(os.getenv("SLEEP_SECONDS", 60))  # espera entre ciclos
 
 # Indicadores
@@ -108,9 +107,10 @@ def check_signals(df):
     return side, sl, tp
 
 # -----------------------
-# Ejecutar orden en Futuros
+# Ejecutar orden en Futuros — 1 contrato fijo
 # -----------------------
-def execute_futures_market(side, quantity):
+def execute_futures_market(side):
+    quantity = 1  # siempre 1 contrato
     try:
         if side == 'BUY':
             res = client.futures_create_order(symbol=SYMBOL, side='BUY', type='MARKET', quantity=quantity)
@@ -129,7 +129,7 @@ def execute_futures_market(side, quantity):
 # MAIN LOOP
 # -----------------------
 if __name__ == "__main__":
-    print("Bot iniciado — mercado REAL (Futures). Símbolo:", SYMBOL, " qty:", TRADE_QUANTITY)
+    print("Bot iniciado — mercado REAL (Futures). Símbolo:", SYMBOL)
     while True:
         df = get_futures_klines(SYMBOL, interval='1m', limit=200)
         if df is None:
@@ -142,10 +142,8 @@ if __name__ == "__main__":
 
         if side:
             print(f"Señal detectada: {side}  SL={sl:.6f}  TP={tp:.6f}")
-            execute_futures_market(side, TRADE_QUANTITY)
+            execute_futures_market(side)
         else:
             print("No hay señales en este ciclo")
 
         time.sleep(SLEEP_SECONDS)
-
-
