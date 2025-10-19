@@ -1,147 +1,151 @@
 import os
-import pandas as pd
 import time
+import pandas as pd
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 
-# =====================
-# Variables de entorno
-# =====================
+# -----------------------
+# CONFIG desde Environment Variables
+# -----------------------
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
-TRADE_AMOUNT = float(os.getenv("TRADE_AMOUNT", 4))  # monto de prueba
-SYMBOL = os.getenv("SYMBOL", "BTCUSDT")            # par WAL/USDT
-USE_TESTNET = os.getenv("USE_TESTNET", "True") == "True"
+SYMBOL = os.getenv("SYMBOL")                  # ejemplo: ETHUSDT
+TRADE_QUANTITY = float(os.getenv("TRADE_QUANTITY"))  # cantidad en contratos/base asset
+SLEEP_SECONDS = int(os.getenv("SLEEP_SECONDS", 60))  # espera entre ciclos
 
-# =====================
-# Conexión a Binance
-# =====================
-client = Client(API_KEY, API_SECRET, testnet=USE_TESTNET)
+# Indicadores
+ATR_LEN = int(os.getenv("ATR_LEN", 14))
+ATR_MULT = float(os.getenv("ATR_MULT", 1.0))
+SHORT_EMA = int(os.getenv("SHORT_EMA", 21))
+LONG_EMA = int(os.getenv("LONG_EMA", 65))
+RSI_FAST = int(os.getenv("RSI_FAST", 25))
+RSI_SLOW = int(os.getenv("RSI_SLOW", 100))
 
-# =====================
-# Obtener datos históricos
-# =====================
-def get_klines(symbol, interval='1m', limit=100):
+# -----------------------
+# Cliente Binance Futures
+# -----------------------
+client = Client(API_KEY, API_SECRET)
+
+# -----------------------
+# Helpers: obtener velas (futuros) y formatear dataframe
+# -----------------------
+def get_futures_klines(symbol, interval='1m', limit=200):
     try:
-        klines = client.get_klines(symbol=symbol, interval=interval, limit=limit)
+        klines = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
         df = pd.DataFrame(klines, columns=[
-            'open_time', 'open', 'high', 'low', 'close', 'volume',
-            'close_time', 'quote_asset_volume', 'number_of_trades',
-            'taker_buy_base', 'taker_buy_quote', 'ignore'
+            'open_time','open','high','low','close','volume','close_time',
+            'quote_asset_volume','num_trades','taker_buy_base','taker_buy_quote','ignore'
         ])
-        for col in ['open', 'high', 'low', 'close', 'volume']:
-            df[col] = df[col].astype(float)
+        for c in ['open','high','low','close','volume']:
+            df[c] = df[c].astype(float)
         return df
     except BinanceAPIException as e:
-        print(f"Error Binance API: {e}")
+        print(f"Error Binance API al obtener klines: {e}")
         return None
     except Exception as e:
-        print(f"Error obteniendo datos: {e}")
+        print(f"Error (get_futures_klines): {e}")
         return None
 
-# =====================
-# Indicadores
-# =====================
+# -----------------------
+# Indicadores: ATR, EMA, RSI doble
+# -----------------------
 def calculate_indicators(df):
-    atr_len = 14
-    atr_mult = 1.0
-    shortEMA_len = 21
-    longEMA_len = 65
-    rsi_len1 = 25
-    rsi_len2 = 100
-
     # ATR
     df['hl'] = df['high'] - df['low']
-    df['hc'] = abs(df['high'] - df['close'].shift())
-    df['lc'] = abs(df['low'] - df['close'].shift())
-    df['tr'] = df[['hl', 'hc', 'lc']].max(axis=1)
-    df['atr'] = df['tr'].rolling(atr_len).mean()
+    df['hc'] = (df['high'] - df['close'].shift(1)).abs()
+    df['lc'] = (df['low'] - df['close'].shift(1)).abs()
+    df['tr'] = df[['hl','hc','lc']].max(axis=1)
+    df['atr'] = df['tr'].rolling(ATR_LEN).mean()
 
-    # ATR Bands
-    df['upper_band'] = df['close'] + df['atr'] * atr_mult
-    df['lower_band'] = df['close'] - df['atr'] * atr_mult
+    # ATR bands
+    df['upper_band'] = df['close'] + df['atr'] * ATR_MULT
+    df['lower_band'] = df['close'] - df['atr'] * ATR_MULT
 
     # EMAs
-    df['shortEMA'] = df['close'].ewm(span=shortEMA_len, adjust=False).mean()
-    df['longEMA'] = df['close'].ewm(span=longEMA_len, adjust=False).mean()
+    df['ema_short'] = df['close'].ewm(span=SHORT_EMA, adjust=False).mean()
+    df['ema_long'] = df['close'].ewm(span=LONG_EMA, adjust=False).mean()
 
-    # RSI
+    # RSI fast & slow
     delta = df['close'].diff()
     up = delta.clip(lower=0)
-    down = -1 * delta.clip(upper=0)
-    roll_up1 = up.rolling(rsi_len1).mean()
-    roll_down1 = down.rolling(rsi_len1).mean()
-    df['rsi1'] = 100 - (100 / (1 + roll_up1 / roll_down1))
-    roll_up2 = up.rolling(rsi_len2).mean()
-    roll_down2 = down.rolling(rsi_len2).mean()
-    df['rsi2'] = 100 - (100 / (1 + roll_up2 / roll_down2))
+    down = -delta.clip(upper=0)
 
-    # RSI Cross
-    df['RSILong'] = df['rsi1'] > df['rsi2']
-    df['RSIShort'] = df['rsi1'] < df['rsi2']
+    roll_up_fast = up.rolling(RSI_FAST).mean()
+    roll_down_fast = down.rolling(RSI_FAST).mean()
+    df['rsi_fast'] = 100 - (100 / (1 + roll_up_fast / roll_down_fast))
 
-    # EMA Cross
-    df['GoldenLong'] = df['shortEMA'] > df['longEMA']
-    df['GoldenShort'] = df['shortEMA'] < df['longEMA']
+    roll_up_slow = up.rolling(RSI_SLOW).mean()
+    roll_down_slow = down.rolling(RSI_SLOW).mean()
+    df['rsi_slow'] = 100 - (100 / (1 + roll_up_slow / roll_down_slow))
+
+    # Cross conditions
+    df['rsi_long'] = df['rsi_fast'] > df['rsi_slow']
+    df['rsi_short'] = df['rsi_fast'] < df['rsi_slow']
+
+    df['golden_long'] = (df['ema_short'] > df['ema_long']) & (df['ema_short'].shift(1) <= df['ema_long'].shift(1))
+    df['golden_short'] = (df['ema_short'] < df['ema_long']) & (df['ema_short'].shift(1) >= df['ema_long'].shift(1))
 
     return df
 
-# =====================
-# Señales de trading
-# =====================
+# -----------------------
+# Señales (igual que tu Pine script)
+# -----------------------
 def check_signals(df):
-    latest = df.iloc[-1]
+    row = df.iloc[-1]
     side = None
-    stopLoss = None
-    takeProfit = None
+    sl = None
+    tp = None
 
-    # Condiciones Long
-    if latest['open'] < latest['lower_band'] and latest['RSILong']:
+    if row['open'] < row['lower_band'] and row['rsi_long']:
         side = 'BUY'
-        stopLoss = latest['low'] - latest['atr'] * 2
-        takeProfit = latest['high'] + latest['atr'] * 5
-
-    # Condiciones Short
-    elif latest['open'] > latest['upper_band'] and latest['RSIShort']:
+        sl = row['low'] - row['atr'] * 2
+        tp = row['high'] + row['atr'] * 5
+    elif row['open'] > row['upper_band'] and row['rsi_short']:
         side = 'SELL'
-        stopLoss = latest['high'] + latest['atr'] * 2
-        takeProfit = latest['low'] - latest['atr'] * 5
+        sl = row['high'] + row['atr'] * 2
+        tp = row['low'] - row['atr'] * 5
 
-    return side, stopLoss, takeProfit
+    return side, sl, tp
 
-# =====================
-# Orden de prueba
-# =====================
-def test_order(side):
+# -----------------------
+# Ejecutar orden en Futuros
+# -----------------------
+def execute_futures_market(side, quantity):
     try:
-        order = client.create_test_order(
-            symbol=SYMBOL,
-            side=side,
-            type='MARKET',
-            quantity=TRADE_AMOUNT
-        )
-        print(f"Orden de prueba {side} ejecutada correctamente")
-    except BinanceAPIException as e:
-        print(f"Error Binance API: {e}")
-    except Exception as e:
-        print(f"Error ejecutando orden de prueba: {e}")
-
-# =====================
-# Loop principal
-# =====================
-if __name__ == "__main__":
-    print("Bot iniciado y corriendo continuamente...")
-    while True:
-        df = get_klines(SYMBOL, interval='1m', limit=100)
-        if df is not None:
-            df = calculate_indicators(df)
-            side, stopLoss, takeProfit = check_signals(df)
-            if side:
-                print(f"Señal detectada: {side}, SL: {stopLoss:.4f}, TP: {takeProfit:.4f}")
-                test_order(side)
-            else:
-                print("No hay señales de trading en este minuto")
+        if side == 'BUY':
+            res = client.futures_create_order(symbol=SYMBOL, side='BUY', type='MARKET', quantity=quantity)
         else:
-            print("Error obteniendo datos, reintentando en 60s")
-        time.sleep(60)
+            res = client.futures_create_order(symbol=SYMBOL, side='SELL', type='MARKET', quantity=quantity)
+        print(f"Orden ejecutada: {side} qty={quantity}  —  id: {res.get('orderId', 'no-id')}")
+        return res
+    except BinanceAPIException as e:
+        print(f"Error Binance API al ejecutar orden: {e}")
+        return None
+    except Exception as e:
+        print(f"Error al ejecutar orden: {e}")
+        return None
+
+# -----------------------
+# MAIN LOOP
+# -----------------------
+if __name__ == "__main__":
+    print("Bot iniciado — mercado REAL (Futures). Símbolo:", SYMBOL, " qty:", TRADE_QUANTITY)
+    while True:
+        df = get_futures_klines(SYMBOL, interval='1m', limit=200)
+        if df is None:
+            print("No se obtuvieron velas. Reintentando en", SLEEP_SECONDS, "s")
+            time.sleep(SLEEP_SECONDS)
+            continue
+
+        df = calculate_indicators(df)
+        side, sl, tp = check_signals(df)
+
+        if side:
+            print(f"Señal detectada: {side}  SL={sl:.6f}  TP={tp:.6f}")
+            execute_futures_market(side, TRADE_QUANTITY)
+        else:
+            print("No hay señales en este ciclo")
+
+        time.sleep(SLEEP_SECONDS)
+
 
