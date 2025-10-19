@@ -1,15 +1,16 @@
 import os
 import pandas as pd
-import numpy as np
+import time
 from binance.client import Client
+from binance.exceptions import BinanceAPIException
 
 # =====================
 # Variables de entorno
 # =====================
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
-TRADE_AMOUNT = float(os.getenv("TRADE_AMOUNT", 4))
-SYMBOL = os.getenv("SYMBOL", "WALUSDT")
+TRADE_AMOUNT = float(os.getenv("TRADE_AMOUNT", 4))  # monto de prueba
+SYMBOL = os.getenv("SYMBOL", "WALUSDT")            # par WAL/USDT
 USE_TESTNET = os.getenv("USE_TESTNET", "True") == "True"
 
 # =====================
@@ -21,21 +22,28 @@ client = Client(API_KEY, API_SECRET, testnet=USE_TESTNET)
 # Obtener datos históricos
 # =====================
 def get_klines(symbol, interval='1m', limit=100):
-    klines = client.get_klines(symbol=symbol, interval=interval, limit=limit)
-    df = pd.DataFrame(klines, columns=[
-        'open_time', 'open', 'high', 'low', 'close', 'volume',
-        'close_time', 'quote_asset_volume', 'number_of_trades',
-        'taker_buy_base', 'taker_buy_quote', 'ignore'
-    ])
-    for col in ['open', 'high', 'low', 'close', 'volume']:
-        df[col] = df[col].astype(float)
-    return df
+    try:
+        klines = client.get_klines(symbol=symbol, interval=interval, limit=limit)
+        df = pd.DataFrame(klines, columns=[
+            'open_time', 'open', 'high', 'low', 'close', 'volume',
+            'close_time', 'quote_asset_volume', 'number_of_trades',
+            'taker_buy_base', 'taker_buy_quote', 'ignore'
+        ])
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = df[col].astype(float)
+        return df
+    except BinanceAPIException as e:
+        print(f"Error Binance API: {e}")
+        return None
+    except Exception as e:
+        print(f"Error obteniendo datos: {e}")
+        return None
 
 # =====================
 # Indicadores
 # =====================
 def calculate_indicators(df):
-    atrlen = 14
+    atr_len = 14
     atr_mult = 1.0
     shortEMA_len = 21
     longEMA_len = 65
@@ -47,7 +55,7 @@ def calculate_indicators(df):
     df['hc'] = abs(df['high'] - df['close'].shift())
     df['lc'] = abs(df['low'] - df['close'].shift())
     df['tr'] = df[['hl', 'hc', 'lc']].max(axis=1)
-    df['atr'] = df['tr'].rolling(atrlen).mean()
+    df['atr'] = df['tr'].rolling(atr_len).mean()
 
     # ATR Bands
     df['upper_band'] = df['close'] + df['atr'] * atr_mult
@@ -79,7 +87,7 @@ def calculate_indicators(df):
     return df
 
 # =====================
-# Revisión de señales
+# Señales de trading
 # =====================
 def check_signals(df):
     latest = df.iloc[-1]
@@ -113,21 +121,26 @@ def test_order(side):
             quantity=TRADE_AMOUNT
         )
         print(f"Orden de prueba {side} ejecutada correctamente")
+    except BinanceAPIException as e:
+        print(f"Error Binance API: {e}")
     except Exception as e:
-        print(f"Error creando orden de prueba: {e}")
+        print(f"Error ejecutando orden de prueba: {e}")
 
 # =====================
-# Ejecución principal
+# Loop principal
 # =====================
 if __name__ == "__main__":
-    print("Bot iniciado...")
-    df = get_klines(SYMBOL, interval='1m', limit=100)
-    df = calculate_indicators(df)
-    side, stopLoss, takeProfit = check_signals(df)
-    if side:
-        print(f"Señal detectada: {side}, SL: {stopLoss}, TP: {takeProfit}")
-        test_order(side)
-    else:
-        print("No hay señales de trading en este momento")
-
-
+    print("Bot iniciado y corriendo continuamente...")
+    while True:
+        df = get_klines(SYMBOL, interval='1m', limit=100)
+        if df is not None:
+            df = calculate_indicators(df)
+            side, stopLoss, takeProfit = check_signals(df)
+            if side:
+                print(f"Señal detectada: {side}, SL: {stopLoss:.4f}, TP: {takeProfit:.4f}")
+                test_order(side)
+            else:
+                print("No hay señales de trading en este minuto")
+        else:
+            print("Error obteniendo datos, reintentando en 60s")
+        time.sleep(60)
