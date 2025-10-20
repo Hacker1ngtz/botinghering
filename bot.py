@@ -260,3 +260,4 @@ if __name__ == "__main__":
             print("No hay señales en este ciclo")
 
         time.sleep(SLEEP_SECONDS)
+
