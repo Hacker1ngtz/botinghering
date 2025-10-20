@@ -48,15 +48,24 @@ def get_symbol_rules(symbol):
     min_qty = float(next(f['minQty'] for f in s_info['filters'] if f['filterType'] == 'LOT_SIZE'))
     return step_size, tick_size, min_notional, min_qty
 
-def calculate_qty_full_balance(symbol, leverage):
+def calculate_qty_full_balance_safe(symbol, leverage):
     balances = client.futures_account_balance()
     usdt_balance = next((float(b['balance']) for b in balances if b['asset'] == 'USDT'), 0.0)
     if usdt_balance <= 0:
         print("⚠️ No hay USDT disponible.")
         return 0.0
+
     price = float(client.futures_symbol_ticker(symbol=symbol)['price'])
-    raw_qty = (usdt_balance * leverage) / price
-    step_size, tick_size, _, min_qty = get_symbol_rules(symbol)
+    step_size, tick_size, min_notional, min_qty = get_symbol_rules(symbol)
+
+    # Usar todo el saldo disponible ajustado por un 1% de margen de seguridad
+    raw_qty = (usdt_balance * leverage * 0.99) / price
+
+    # Validar mínimo notional
+    if raw_qty * price < min_notional:
+        print(f"⚠️ Qty calculada menor al mínimo notional ({min_notional})")
+        return 0.0
+
     qty = max(round_step(raw_qty, step_size), min_qty)
     return qty
 
@@ -136,7 +145,6 @@ def open_position(symbol, side, qty, atr):
         quantity=qty
     )
     step_size, tick_size, _, _ = get_symbol_rules(symbol)
-    # SL/TP dinámico
     price = float(client.futures_symbol_ticker(symbol=symbol)['price'])
     sl_price = price - ATR_MULT_SL * atr if side=='LONG' else price + ATR_MULT_SL * atr
     tp_price = price + ATR_MULT_TP * atr if side=='LONG' else price - ATR_MULT_TP * atr
@@ -177,7 +185,7 @@ if __name__ == "__main__":
             signal = check_signal(df)
             if signal:
                 atr = df['atr'].iloc[-1]
-                qty = calculate_qty_full_balance(SYMBOL, LEVERAGE)
+                qty = calculate_qty_full_balance_safe(SYMBOL, LEVERAGE)
                 print(f"Señal {signal} detectada. Abrir posición qty={qty}")
                 open_position(SYMBOL, signal, qty, atr)
             else:
@@ -185,4 +193,5 @@ if __name__ == "__main__":
         except Exception as e:
             print("⚠️ Error:", e)
         time.sleep(SLEEP_SECONDS)
+
 
