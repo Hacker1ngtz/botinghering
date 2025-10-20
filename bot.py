@@ -1,96 +1,170 @@
 import os
 import asyncio
-import pandas as pd
-import numpy as np
+from datetime import datetime, time as dtime
 from binance import AsyncClient, BinanceSocketManager
-from binance.enums import *
+from binance.enums import SIDE_BUY, SIDE_SELL, ORDER_TYPE_MARKET
 from dotenv import load_dotenv
-from datetime import datetime
+import numpy as np
 
-# ===== Cargar variables de entorno =====
+# -------------------- Cargar configuración --------------------
 load_dotenv()
 API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
-TRADE_AMOUNT = float(os.getenv("TRADE_AMOUNT", 0))
-TRADE_QUANTITY = float(os.getenv("TRADE_QUANTITY", 0))
-PIVOT_PERIOD = int(os.getenv("PIVOT_PERIOD", 16))
-PIPS = int(os.getenv("PIPS", 64))
-SPREAD = int(os.getenv("SPREAD", 0))
+TRADE_QUANTITY = float(os.getenv("TRADE_QUANTITY", 0.01))
+TRADE_PIPS = float(os.getenv("TRADE_PIPS", 64))  # en ticks, ajustable
+TRADE_SPREAD = float(os.getenv("TRADE_SPREAD", 0))
 SYMBOL = "WALUSDT"
-TIMEFRAME = "1m"  # Velas de 1 minuto, puedes cambiar
+EMA_FAST_PERIOD = 25
+EMA_SLOW_PERIOD = 100
+PIVOT_PERIOD = 16
 
-# ===== Funciones de estrategia =====
-def calculate_ema(prices, period):
-    return prices.ewm(span=period, adjust=False).mean()
+# Sesión de scalping
+SESSION_START = dtime(8,30)
+SESSION_END = dtime(9,30)
 
-def pivot_high(df, period):
-    return df['high'].rolling(window=period, center=True).max()
+# -------------------- Funciones técnicas --------------------
+def ema(prices, period):
+    if len(prices) < period:
+        return prices[-1]
+    weights = np.exp(np.linspace(-1., 0., period))
+    weights /= weights.sum()
+    return np.dot(prices[-period:], weights)
 
-def pivot_low(df, period):
-    return df['low'].rolling(window=period, center=True).min()
-
-async def fetch_klines(client, symbol, interval, limit=500):
-    klines = await client.get_klines(symbol=symbol, interval=interval, limit=limit)
-    df = pd.DataFrame(klines, columns=[
-        'open_time','open','high','low','close','volume','close_time','quote_av','trades','tb_base_av','tb_quote_av','ignore'
-    ])
-    df['open'] = df['open'].astype(float)
-    df['high'] = df['high'].astype(float)
-    df['low'] = df['low'].astype(float)
-    df['close'] = df['close'].astype(float)
-    return df
-
-# ===== Estrategia de scalping =====
-def check_signals(df):
-    df['ema100'] = calculate_ema(df['close'], 100)
-    df['ema25'] = calculate_ema(df['close'], 25)
-    df['ph'] = pivot_high(df, PIVOT_PERIOD)
-    df['pl'] = pivot_low(df, PIVOT_PERIOD)
-
-    last_row = df.iloc[-1]
-    prev_row = df.iloc[-2]
-
-    # Señal de compra
-    if last_row['ema25'] > last_row['ema100'] and prev_row['close'] < prev_row['ph'] and last_row['close'] > last_row['ph']:
-        return "BUY"
-    # Señal de venta
-    if last_row['ema25'] < last_row['ema100'] and prev_row['close'] > prev_row['pl'] and last_row['close'] < last_row['pl']:
-        return "SELL"
+def pivot_high(prices, period):
+    if len(prices) < period*2+1:
+        return None
+    center = prices[-(period+1)]
+    if center == max(prices[-(2*period+1):]):
+        return center
     return None
 
-# ===== Función principal =====
+def pivot_low(prices, period):
+    if len(prices) < period*2+1:
+        return None
+    center = prices[-(period+1)]
+    if center == min(prices[-(2*period+1):]):
+        return center
+    return None
+
+def in_session():
+    now = datetime.utcnow().time()
+    return SESSION_START <= now <= SESSION_END
+
+# -------------------- Órdenes --------------------
+async def place_order(client, side, quantity, tp_price=None, sl_price=None):
+    try:
+        order = await client.create_order(
+            symbol=SYMBOL,
+            side=side,
+            type=ORDER_TYPE_MARKET,
+            quantity=quantity
+        )
+        entry_price = float(order['fills'][0]['price'])
+        print(f"{datetime.now()} - Orden ejecutada: {side} {quantity} {SYMBOL} a {entry_price}")
+
+        # Calcular TP y SL
+        if tp_price is None:
+            if side == SIDE_BUY:
+                tp_price = entry_price + TRADE_PIPS + TRADE_SPREAD
+                sl_price = entry_price - TRADE_PIPS
+            else:
+                tp_price = entry_price - (TRADE_PIPS + TRADE_SPREAD)
+                sl_price = entry_price + TRADE_PIPS
+
+        return {"side": side, "entry": entry_price, "tp": tp_price, "sl": sl_price, "open": True}
+    except Exception as e:
+        print(f"{datetime.now()} - Error ejecutando orden: {e}")
+        return None
+
+async def check_close_order(client, order, price):
+    if not order or not order['open']:
+        return
+    side = order['side']
+    if side == SIDE_BUY:
+        if price >= order['tp'] or price <= order['sl']:
+            await close_order(client, SIDE_SELL, TRADE_QUANTITY, price)
+            order['open'] = False
+    elif side == SIDE_SELL:
+        if price <= order['tp'] or price >= order['sl']:
+            await close_order(client, SIDE_BUY, TRADE_QUANTITY, price)
+            order['open'] = False
+
+async def close_order(client, side, quantity, price):
+    try:
+        await client.create_order(
+            symbol=SYMBOL,
+            side=side,
+            type=ORDER_TYPE_MARKET,
+            quantity=quantity
+        )
+        print(f"{datetime.now()} - Posición cerrada: {side} {quantity} {SYMBOL} a {price}")
+    except Exception as e:
+        print(f"{datetime.now()} - Error cerrando posición: {e}")
+
+# -------------------- Estrategia principal --------------------
+async def scalping_strategy(client):
+    bm = BinanceSocketManager(client)
+    async with bm.kline_socket(SYMBOL, interval='1m') as stream:
+        print(f"{datetime.now()} - 🚀 Bot scalping realtime activo en {SYMBOL}")
+        
+        closes, highs, lows = [], [], []
+        last_high_pivot, last_low_pivot = None, None
+        last_order = None
+        active_order = None
+
+        async for msg in stream:
+            k = msg['k']
+            close = float(k['c'])
+            open_p = float(k['o'])
+            high = float(k['h'])
+            low = float(k['l'])
+
+            closes.append(close)
+            highs.append(high)
+            lows.append(low)
+
+            ema_fast = ema(closes, EMA_FAST_PERIOD)
+            ema_slow = ema(closes, EMA_SLOW_PERIOD)
+
+            ph = pivot_high(highs, PIVOT_PERIOD)
+            pl = pivot_low(lows, PIVOT_PERIOD)
+
+            if ph is not None:
+                last_high_pivot = ph
+            if pl is not None:
+                last_low_pivot = pl
+
+            if not in_session():
+                continue
+
+            # Revisar cierre de posición activa
+            if active_order:
+                await check_close_order(client, active_order, close)
+                if not active_order['open']:
+                    active_order = None
+
+            # Estrategia de compra
+            if ema_fast > ema_slow and last_high_pivot is not None:
+                if close > last_high_pivot and open_p < last_high_pivot and last_order != "BUY" and not active_order:
+                    active_order = await place_order(client, SIDE_BUY, TRADE_QUANTITY)
+                    last_order = "BUY"
+                    last_high_pivot = None
+
+            # Estrategia de venta
+            if ema_fast < ema_slow and last_low_pivot is not None:
+                if close < last_low_pivot and open_p > last_low_pivot and last_order != "SELL" and not active_order:
+                    active_order = await place_order(client, SIDE_SELL, TRADE_QUANTITY)
+                    last_order = "SELL"
+                    last_low_pivot = None
+
+# -------------------- Main --------------------
 async def main():
     client = await AsyncClient.create(API_KEY, API_SECRET)
-    bsm = BinanceSocketManager(client)
-
-    print(f"🚀 Bot scalping realtime activo en {SYMBOL}")
-
-    while True:
-        try:
-            # Obtener velas recientes
-            df = await fetch_klines(client, SYMBOL, TIMEFRAME, limit=500)
-            signal = check_signals(df)
-            price = float(df['close'].iloc[-1])
-            print(f"{datetime.now()} - Precio: {price} - Señal: {signal}")
-
-            if signal == "BUY":
-                # Aquí colocas tu orden de compra
-                print(f"📈 Ejecutar BUY - Cantidad: {TRADE_QUANTITY}")
-                # await client.create_order(symbol=SYMBOL, side=SIDE_BUY, type=ORDER_TYPE_MARKET, quantity=TRADE_QUANTITY)
-
-            elif signal == "SELL":
-                # Aquí colocas tu orden de venta
-                print(f"📉 Ejecutar SELL - Cantidad: {TRADE_QUANTITY}")
-                # await client.create_order(symbol=SYMBOL, side=SIDE_SELL, type=ORDER_TYPE_MARKET, quantity=TRADE_QUANTITY)
-
-            # Esperar 1 minuto antes de la siguiente verificación
-            await asyncio.sleep(60)
-
-        except Exception as e:
-            print(f"⚠ Error: {e}, reconectando en 5 segundos...")
-            await asyncio.sleep(5)
-
-    await client.close_connection()
+    try:
+        await scalping_strategy(client)
+    finally:
+        await client.close_connection()
 
 if __name__ == "__main__":
     asyncio.run(main())
+
