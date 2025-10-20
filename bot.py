@@ -1,324 +1,166 @@
-# bot.py
-import os
-import time
-import math
-import pandas as pd
-from binance.client import Client
-from binance.exceptions import BinanceAPIException
+import os, asyncio, json, pandas as pd, numpy as np
+from binance import AsyncClient, BinanceSocketManager
+from binance.enums import *
+from dotenv import load_dotenv
 
-# ------------------------------
-# Config desde Environment
-# ------------------------------
+load_dotenv()
+
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
-SYMBOL = os.getenv("SYMBOL", "ETHUSDT").upper()
-LEVERAGE = int(os.getenv("LEVERAGE", 10))
-SLEEP_SECONDS = int(os.getenv("SLEEP_SECONDS", 60))
 
-# Indicadores (opcionales)
-ATR_LEN = int(os.getenv("ATR_LEN", 14))
-ATR_MULT = float(os.getenv("ATR_MULT", 1.0))
-SHORT_EMA = int(os.getenv("SHORT_EMA", 21))
-LONG_EMA = int(os.getenv("LONG_EMA", 65))
-RSI_FAST = int(os.getenv("RSI_FAST", 25))
-RSI_SLOW = int(os.getenv("RSI_SLOW", 100))
+SYMBOL = "WALUSDT"
+INTERVAL = "1m"
+EMA_FAST = 25
+EMA_SLOW = 100
+PIPS = 64
+QTY = 10
 
-# ------------------------------
-# Cliente Binance Futures (real)
-# ------------------------------
-client = Client(API_KEY, API_SECRET)
+# ----------------------------- #
+async def main():
+    client = await AsyncClient.create(API_KEY, API_SECRET)
+    bm = BinanceSocketManager(client)
+    socket = bm.kline_socket(symbol=SYMBOL, interval=INTERVAL)
 
-# ------------------------------
-# Helpers: market data, filters
-# ------------------------------
-def get_futures_klines(symbol, interval='1m', limit=200):
+    df = pd.DataFrame(columns=["open","high","low","close"])
+
+    async with socket as stream:
+        print(f"🚀 Bot scalping realtime activo en {SYMBOL}")
+        async for msg in stream:
+            data = msg["k"]
+            closed = data["x"]             # vela cerrada?
+            close = float(data["c"])
+            high = float(data["h"])
+            low  = float(data["l"])
+            openp = float(data["o"])
+
+            if closed:
+                df.loc[len(df)] = [openp, high, low, close]
+
+                # mantener sólo las últimas 500 velas
+                df = df.tail(500)
+
+                if len(df) > EMA_SLOW:
+                    df["ema_fast"] = df["close"].ewm(span=EMA_FAST).mean()
+                    df["ema_slow"] = df["close"].ewm(span=EMA_SLOW).mean()
+                    trend = 1 if df["ema_fast"].iloc[-1] > df["ema_slow"].iloc[-1] else -1
+
+                    # pivotes simples
+                    last_high = df["high"].iloc[-5:-1].max()
+                    last_low  = df["low"].iloc[-5:-1].min()
+
+                    # señales
+                    if trend == 1 and close > last_high:
+                        tp = close + (PIPS * 0.0001)
+                        sl = close - (PIPS * 0.0001)
+                        await send_order(client, SIDE_BUY, QTY, tp, sl)
+                    elif trend == -1 and close < last_low:
+                        tp = close - (PIPS * 0.0001)
+                        sl = close + (PIPS * 0.0001)
+                        await send_order(client, SIDE_SELL, QTY, tp, sl)
+
+    await client.close_connection()
+
+# ----------------------------- #
+async def send_order(client, side, qty, tp, sl):
     try:
-        klines = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
-        df = pd.DataFrame(klines, columns=[
-            'open_time','open','high','low','close','volume','close_time',
-            'quote_asset_volume','num_trades','taker_buy_base','taker_buy_quote','ignore'
-        ])
-        for c in ['open','high','low','close','volume']:
-            df[c] = df[c].astype(float)
-        return df
+        print(f"🟢 {side} | TP {tp:.4f} | SL {sl:.4f}")
+        # Descomenta para órdenes reales:
+        # await client.create_order(
+        #     symbol=SYMBOL,
+        #     side=side,
+        #     type=ORDER_TYPE_MARKET,
+        #     quantity=qty
+        # )
     except Exception as e:
-        print("Error al obtener klines:", e)
-        return None
+        print(f"⚠️ Error al enviar orden: {e}")
 
-def get_symbol_rules(symbol):
-    """Devuelve (stepSize, tickSize, minNotional, minQty) del symbol en futures"""
-    try:
-        info = client.futures_exchange_info()
-        for s in info.get('symbols', []):
-            if s['symbol'] == symbol:
-                step_size = 0.0
-                tick_size = 0.0
-                min_notional = None
-                min_qty = None
-                for f in s.get('filters', []):
-                    if f.get('filterType') == 'LOT_SIZE':
-                        step_size = float(f.get('stepSize', 0.0))
-                        min_qty = float(f.get('minQty', 0.0))
-                    if f.get('filterType') == 'PRICE_FILTER':
-                        tick_size = float(f.get('tickSize', 0.0))
-                    if f.get('filterType') == 'MIN_NOTIONAL':
-                        # some APIs use 'notional' key, some 'minNotional'
-                        min_notional = float(f.get('notional', f.get('minNotional', 0.0)))
-                # defaults
-                if step_size == 0.0: step_size = 0.00000001
-                if tick_size == 0.0: tick_size = 0.00000001
-                if min_notional is None: min_notional = 5.0
-                if min_qty is None: min_qty = 0.0
-                return step_size, tick_size, min_notional, min_qty
-    except Exception as e:
-        print("Error al obtener symbol rules:", e)
-    # fallback
-    return 0.00000001, 0.00000001, 5.0, 0.0
-
-def round_step(quantity, step):
-    """Redondea hacia abajo a múltiplo de step"""
-    if step <= 0:
-        return quantity
-    precision = max(0, int(round(-math.log10(step))))
-    qty = math.floor(quantity / step) * step
-    return round(qty, precision)
-
-def round_price(price, tick):
-    if tick <= 0:
-        return price
-    precision = max(0, int(round(-math.log10(tick))))
-    return round(price, precision)
-
-# ------------------------------
-# Indicadores: ATR, EMA, RSI doble
-# ------------------------------
-def calculate_indicators(df):
-    df = df.copy()
-    df['hl'] = df['high'] - df['low']
-    df['hc'] = (df['high'] - df['close'].shift(1)).abs()
-    df['lc'] = (df['low'] - df['close'].shift(1)).abs()
-    df['tr'] = df[['hl','hc','lc']].max(axis=1)
-    df['atr'] = df['tr'].rolling(ATR_LEN).mean()
-
-    df['upper_band'] = df['close'] + df['atr'] * ATR_MULT
-    df['lower_band'] = df['close'] - df['atr'] * ATR_MULT
-
-    df['ema_short'] = df['close'].ewm(span=SHORT_EMA, adjust=False).mean()
-    df['ema_long'] = df['close'].ewm(span=LONG_EMA, adjust=False).mean()
-
-    delta = df['close'].diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    roll_up_fast = up.rolling(RSI_FAST).mean()
-    roll_down_fast = down.rolling(RSI_FAST).mean()
-    df['rsi_fast'] = 100 - (100 / (1 + roll_up_fast / roll_down_fast))
-    roll_up_slow = up.rolling(RSI_SLOW).mean()
-    roll_down_slow = down.rolling(RSI_SLOW).mean()
-    df['rsi_slow'] = 100 - (100 / (1 + roll_up_slow / roll_down_slow))
-
-    df['rsi_long'] = df['rsi_fast'] > df['rsi_slow']
-    df['rsi_short'] = df['rsi_fast'] < df['rsi_slow']
-
-    df['golden_long'] = (df['ema_short'] > df['ema_long']) & (df['ema_short'].shift(1) <= df['ema_long'].shift(1))
-    df['golden_short'] = (df['ema_short'] < df['ema_long']) & (df['ema_short'].shift(1) >= df['ema_long'].shift(1))
-
-    return df
-
-# ------------------------------
-# Señales similares al Pine original
-# ------------------------------
-def check_signals(df):
-    row = df.iloc[-1]
-    side = None
-    sl = None
-    tp = None
-    if row['open'] < row['lower_band'] and row['rsi_long']:
-        side = 'LONG'
-        sl = row['low'] - row['atr'] * 2
-        tp = row['high'] + row['atr'] * 5
-    elif row['open'] > row['upper_band'] and row['rsi_short']:
-        side = 'SHORT'
-        sl = row['high'] + row['atr'] * 2
-        tp = row['low'] - row['atr'] * 5
-    return side, sl, tp
-
-# ------------------------------
-# Posición actual
-# ------------------------------
-def get_current_position(symbol):
-    try:
-        pos = client.futures_position_information(symbol=symbol)
-        for p in pos:
-            if p['symbol'] == symbol:
-                amt = float(p['positionAmt'])
-                entry = float(p.get('entryPrice', 0.0))
-                return amt, entry
-    except Exception as e:
-        print("Error get_current_position:", e)
-    return 0.0, 0.0
-
-# ------------------------------
-# Cerrar opuesta (reduceOnly market)
-# ------------------------------
-def close_opposite_if_needed(symbol, target_side):
-    amt, entry = get_current_position(symbol)
-    if amt == 0:
-        return True
-    existing_side = 'LONG' if amt > 0 else 'SHORT'
-    if existing_side == target_side:
-        return True
-    qty = abs(amt)
-    try:
-        # reduceOnly market to close
-        side_for_close = 'SELL' if amt > 0 else 'BUY'
-        client.futures_create_order(symbol=symbol, side=side_for_close, type='MARKET', quantity=qty, reduceOnly=True)
-        print(f"Cerrada posición opuesta ({existing_side}) qty={qty}")
-        time.sleep(1)
-        return True
-    except Exception as e:
-        print("Error cerrando opuesta:", e)
-        return False
-
-# ------------------------------
-# Calcular quantity usando 100% balance * leverage
-# ------------------------------
-def calculate_qty_full_balance(symbol, leverage):
-    try:
-        # obtener USDT balance (futures)
-        balances = client.futures_account_balance()
-        usdt_balance = 0.0
-        for b in balances:
-            if b['asset'] == 'USDT':
-                usdt_balance = float(b.get('balance', 0.0))
-                break
-        if usdt_balance <= 0:
-            print("Balance USDT vacío.")
-            return 0.0
-
-        price = float(client.futures_symbol_ticker(symbol=symbol)['price'])
-        raw_notional = usdt_balance * leverage
-        raw_qty = raw_notional / price
-
-        step_size, tick_size, min_notional, min_qty = get_symbol_rules(symbol)
-        qty = round_step(raw_qty, step_size)
-        notional = qty * price
-
-        # intentar asegurar min_notional
-        if notional < min_notional:
-            # incrementar por steps hasta superar min_notional, pero cuidado con overflow
-            steps = math.ceil((min_notional - notional) / (price * step_size)) if step_size>0 else 0
-            qty = qty + steps * step_size
-            qty = round_step(qty, step_size)
-            notional = qty * price
-
-        if qty < min_qty:
-            qty = min_qty
-            qty = round_step(qty, step_size)
-            notional = qty * price
-
-        if qty <= 0 or notional < min_notional:
-            print(f"No se pudo calcular qty válida. notional={notional} min_notional={min_notional}")
-            return 0.0
-
-        return qty
-    except Exception as e:
-        print("Error calculate_qty_full_balance:", e)
-        return 0.0
-
-# ------------------------------
-# Abrir posición market + crear TP y SL reduceOnly
-# ------------------------------
-def open_position_with_tp_sl(symbol, side, sl_price, tp_price):
-    # cerrar opuesta si aplica
-    ok = close_opposite_if_needed(symbol, side)
-    if not ok:
-        print("No se cerró posición opuesta, abortando apertura.")
-        return None
-
-    qty = calculate_qty_full_balance(symbol, LEVERAGE)
-    if qty <= 0:
-        print("Qty inválida, abortando.")
-        return None
-
-    try:
-        # abrir market
-        order = client.futures_create_order(symbol=symbol, side='BUY' if side=='LONG' else 'SELL', type='MARKET', quantity=qty)
-        order_id = order.get('orderId')
-        print(f"Abrida posición {side} qty={qty} orderId={order_id}")
-
-        # obtener tick y step para redondeos
-        step_size, tick_size, min_notional, min_qty = get_symbol_rules(symbol)
-
-        # redondear SL y TP
-        slp = round_price(sl_price, tick_size)
-        tpp = round_price(tp_price, tick_size)
-
-        # crear stop market (reduceOnly)
-        try:
-            # STOP_MARKET order: usa 'stopPrice' y reduceOnly
-            client.futures_create_order(
-                symbol=symbol,
-                side='SELL' if side=='LONG' else 'BUY',
-                type='STOP_MARKET',
-                stopPrice=slp,
-                closePosition=False,
-                reduceOnly=True,
-                quantity=qty
-            )
-            print(f"SL (reduceOnly STOP_MARKET) colocado en {slp}")
-        except Exception as e:
-            print("No se pudo colocar SL:", e)
-
-        # crear take profit market (reduceOnly)
-        try:
-            client.futures_create_order(
-                symbol=symbol,
-                side='SELL' if side=='LONG' else 'BUY',
-                type='TAKE_PROFIT_MARKET',
-                stopPrice=tpp,
-                closePosition=False,
-                reduceOnly=True,
-                quantity=qty
-            )
-            print(f"TP (reduceOnly TAKE_PROFIT_MARKET) colocado en {tpp}")
-        except Exception as e:
-            print("No se pudo colocar TP:", e)
-
-        return order
-    except Exception as e:
-        print("Error abriendo posición market:", e)
-        return None
-
-# ------------------------------
-# Main
-# ------------------------------
+# ----------------------------- #
 if __name__ == "__main__":
-    # establecer apalancamiento
     try:
-        client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
-        print(f"Apalancamiento establecido: x{LEVERAGE} para {SYMBOL}")
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("🛑 Detenido manualmente.")
+import os, asyncio, json, pandas as pd, numpy as np
+from binance import AsyncClient, BinanceSocketManager
+from binance.enums import *
+from dotenv import load_dotenv
+
+load_dotenv()
+
+API_KEY = os.getenv("BINANCE_API_KEY")
+API_SECRET = os.getenv("BINANCE_API_SECRET")
+
+SYMBOL = "WALUSDT"
+INTERVAL = "1m"
+EMA_FAST = 25
+EMA_SLOW = 100
+PIPS = 64
+QTY = 10
+
+# ----------------------------- #
+async def main():
+    client = await AsyncClient.create(API_KEY, API_SECRET)
+    bm = BinanceSocketManager(client)
+    socket = bm.kline_socket(symbol=SYMBOL, interval=INTERVAL)
+
+    df = pd.DataFrame(columns=["open","high","low","close"])
+
+    async with socket as stream:
+        print(f"🚀 Bot scalping realtime activo en {SYMBOL}")
+        async for msg in stream:
+            data = msg["k"]
+            closed = data["x"]             # vela cerrada?
+            close = float(data["c"])
+            high = float(data["h"])
+            low  = float(data["l"])
+            openp = float(data["o"])
+
+            if closed:
+                df.loc[len(df)] = [openp, high, low, close]
+
+                # mantener sólo las últimas 500 velas
+                df = df.tail(500)
+
+                if len(df) > EMA_SLOW:
+                    df["ema_fast"] = df["close"].ewm(span=EMA_FAST).mean()
+                    df["ema_slow"] = df["close"].ewm(span=EMA_SLOW).mean()
+                    trend = 1 if df["ema_fast"].iloc[-1] > df["ema_slow"].iloc[-1] else -1
+
+                    # pivotes simples
+                    last_high = df["high"].iloc[-5:-1].max()
+                    last_low  = df["low"].iloc[-5:-1].min()
+
+                    # señales
+                    if trend == 1 and close > last_high:
+                        tp = close + (PIPS * 0.0001)
+                        sl = close - (PIPS * 0.0001)
+                        await send_order(client, SIDE_BUY, QTY, tp, sl)
+                    elif trend == -1 and close < last_low:
+                        tp = close - (PIPS * 0.0001)
+                        sl = close + (PIPS * 0.0001)
+                        await send_order(client, SIDE_SELL, QTY, tp, sl)
+
+    await client.close_connection()
+
+# ----------------------------- #
+async def send_order(client, side, qty, tp, sl):
+    try:
+        print(f"🟢 {side} | TP {tp:.4f} | SL {sl:.4f}")
+        # Descomenta para órdenes reales:
+        # await client.create_order(
+        #     symbol=SYMBOL,
+        #     side=side,
+        #     type=ORDER_TYPE_MARKET,
+        #     quantity=qty
+        # )
     except Exception as e:
-        print("Warning: no se pudo establecer apalancamiento:", e)
+        print(f"⚠️ Error al enviar orden: {e}")
 
-    print("Bot iniciado — MERCADO REAL (Futures). Símbolo:", SYMBOL)
+# ----------------------------- #
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("🛑 Detenido manualmente.")
 
-    while True:
-        df = get_futures_klines(SYMBOL, interval='1m', limit=200)
-        if df is None:
-            print("No se obtuvieron velas. Reintentando en", SLEEP_SECONDS, "s")
-            time.sleep(SLEEP_SECONDS)
-            continue
 
-        df = calculate_indicators(df)
-        signal, sl, tp = check_signals(df)
-
-        if signal == 'LONG':
-            print("Señal LONG detectada. Intentando abrir posición con TP/SL...")
-            open_position_with_tp_sl(SYMBOL, 'LONG', sl, tp)
-        elif signal == 'SHORT':
-            print("Señal SHORT detectada. Intentando abrir posición con TP/SL...")
-            open_position_with_tp_sl(SYMBOL, 'SHORT', sl, tp)
-        else:
-            print("No hay señales en este ciclo")
-
-        time.sleep(SLEEP_SECONDS)
