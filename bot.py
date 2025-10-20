@@ -12,7 +12,7 @@ API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
 SYMBOL = os.getenv("SYMBOL", "BNBUSDT").upper()
 LEVERAGE = int(os.getenv("LEVERAGE", 10))
-SLEEP_SECONDS = float(os.getenv("SLEEP_SECONDS", 1.5))  # loop rápido para scalping
+SLEEP_SECONDS = float(os.getenv("SLEEP_SECONDS", 1.5))
 
 # Indicadores configurables
 EMA_FAST = int(os.getenv("EMA_FAST", 8))
@@ -21,6 +21,7 @@ RSI_LEN = int(os.getenv("RSI_LEN", 5))
 ATR_LEN = int(os.getenv("ATR_LEN", 7))
 ATR_MULT_SL = float(os.getenv("ATR_MULT_SL", 0.5))
 ATR_MULT_TP = float(os.getenv("ATR_MULT_TP", 1.2))
+TRAILING_SL_STEP = float(os.getenv("TRAILING_SL_STEP", 0.5))  # % del ATR
 
 # ==============================
 # CLIENTE BINANCE FUTURES
@@ -57,13 +58,10 @@ def calculate_qty_full_balance_safe(symbol, leverage):
 
     price = float(client.futures_symbol_ticker(symbol=symbol)['price'])
     step_size, tick_size, min_notional, min_qty = get_symbol_rules(symbol)
-
-    # Usar todo el saldo disponible ajustado por un 1% de margen de seguridad
     raw_qty = (usdt_balance * leverage * 0.99) / price
 
-    # Validar mínimo notional
     if raw_qty * price < min_notional:
-        print(f"⚠️ Qty calculada menor al mínimo notional ({min_notional})")
+        print(f"⚠️ Qty menor al mínimo notional ({min_notional})")
         return 0.0
 
     qty = max(round_step(raw_qty, step_size), min_qty)
@@ -80,7 +78,7 @@ def get_futures_klines(symbol, interval='1m', limit=200):
     return df
 
 # ==============================
-# CALCULO INDICADORES
+# INDICADORES
 # ==============================
 def calculate_indicators(df):
     df = df.copy()
@@ -100,7 +98,7 @@ def calculate_indicators(df):
     return df
 
 # ==============================
-# LOGICA DE SEÑALES
+# SEÑALES
 # ==============================
 def check_signal(df):
     row = df.iloc[-1]
@@ -121,36 +119,68 @@ def get_current_position(symbol):
             return float(p['positionAmt'])
     return 0.0
 
-def close_opposite_if_needed(symbol, target_side):
-    amt = get_current_position(symbol)
-    if amt == 0:
-        return True
-    existing_side = 'LONG' if amt > 0 else 'SHORT'
-    if existing_side == target_side:
-        return True
-    side_for_close = SIDE_SELL if amt > 0 else SIDE_BUY
-    qty = abs(amt)
-    client.futures_create_order(symbol=symbol, side=side_for_close, type='MARKET', quantity=qty, reduceOnly=True)
-    time.sleep(0.5)
-    return True
+def is_position_open(symbol):
+    return abs(get_current_position(symbol)) > 0
+
+def manage_trailing_stop(symbol, side, atr):
+    """ Ajusta el SL si la posición se mueve a favor """
+    pos_amt = get_current_position(symbol)
+    if pos_amt == 0:
+        return
+
+    price = float(client.futures_symbol_ticker(symbol=symbol)['price'])
+    step_size, tick_size, _, _ = get_symbol_rules(symbol)
+
+    # Trailing SL
+    if side == 'LONG':
+        new_sl = price - TRAILING_SL_STEP * atr
+        new_sl = round_price(new_sl, tick_size)
+        try:
+            client.futures_create_order(
+                symbol=symbol,
+                side=SIDE_SELL,
+                type='STOP_MARKET',
+                stopPrice=new_sl,
+                closePosition=True
+            )
+            print(f"🔄 Trailing SL ajustado LONG a {new_sl}")
+        except:
+            pass
+    elif side == 'SHORT':
+        new_sl = price + TRAILING_SL_STEP * atr
+        new_sl = round_price(new_sl, tick_size)
+        try:
+            client.futures_create_order(
+                symbol=symbol,
+                side=SIDE_BUY,
+                type='STOP_MARKET',
+                stopPrice=new_sl,
+                closePosition=True
+            )
+            print(f"🔄 Trailing SL ajustado SHORT a {new_sl}")
+        except:
+            pass
 
 def open_position(symbol, side, qty, atr):
-    ok = close_opposite_if_needed(symbol, side)
-    if not ok or qty <= 0:
+    if is_position_open(symbol):
+        print("⚠️ Ya hay posición abierta. Esperando cierre...")
         return None
-    order = client.futures_create_order(
-        symbol=symbol,
-        side=SIDE_BUY if side=='LONG' else SIDE_SELL,
-        type=FUTURE_ORDER_TYPE_MARKET,
-        quantity=qty
-    )
-    step_size, tick_size, _, _ = get_symbol_rules(symbol)
+
     price = float(client.futures_symbol_ticker(symbol=symbol)['price'])
-    sl_price = price - ATR_MULT_SL * atr if side=='LONG' else price + ATR_MULT_SL * atr
-    tp_price = price + ATR_MULT_TP * atr if side=='LONG' else price - ATR_MULT_TP * atr
+    step_size, tick_size, _, _ = get_symbol_rules(symbol)
+    sl_price = price - ATR_MULT_SL*atr if side=='LONG' else price + ATR_MULT_SL*atr
+    tp_price = price + ATR_MULT_TP*atr if side=='LONG' else price - ATR_MULT_TP*atr
     sl_price = round_price(sl_price, tick_size)
     tp_price = round_price(tp_price, tick_size)
+
     try:
+        order = client.futures_create_order(
+            symbol=symbol,
+            side=SIDE_BUY if side=='LONG' else SIDE_SELL,
+            type=FUTURE_ORDER_TYPE_MARKET,
+            quantity=qty
+        )
+        # SL y TP inicial
         client.futures_create_order(
             symbol=symbol,
             side=SIDE_SELL if side=='LONG' else SIDE_BUY,
@@ -158,9 +188,6 @@ def open_position(symbol, side, qty, atr):
             stopPrice=sl_price,
             closePosition=True
         )
-    except Exception as e:
-        print("⚠️ Error SL:", e)
-    try:
         client.futures_create_order(
             symbol=symbol,
             side=SIDE_SELL if side=='LONG' else SIDE_BUY,
@@ -168,30 +195,41 @@ def open_position(symbol, side, qty, atr):
             stopPrice=tp_price,
             closePosition=True
         )
+        print(f"✅ Posición {side} abierta. TP={tp_price}, SL={sl_price}, qty={qty}")
+        return side
     except Exception as e:
-        print("⚠️ Error TP:", e)
-    return order
+        print("⚠️ Error abriendo posición:", e)
+        return None
 
 # ==============================
 # LOOP PRINCIPAL
 # ==============================
 if __name__ == "__main__":
     client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
-    print(f"🚀 Bot scalping iniciado para {SYMBOL} con x{LEVERAGE}")
+    print(f"🚀 Bot scalping con Trailing Stop iniciado para {SYMBOL} x{LEVERAGE}")
+    active_side = None
     while True:
         try:
             df = get_futures_klines(SYMBOL, interval='1m', limit=50)
             df = calculate_indicators(df)
-            signal = check_signal(df)
-            if signal:
-                atr = df['atr'].iloc[-1]
-                qty = calculate_qty_full_balance_safe(SYMBOL, LEVERAGE)
-                print(f"Señal {signal} detectada. Abrir posición qty={qty}")
-                open_position(SYMBOL, signal, qty, atr)
+            atr = df['atr'].iloc[-1]
+
+            # Si hay posición activa, ajustar trailing SL
+            if is_position_open(SYMBOL) and active_side:
+                manage_trailing_stop(SYMBOL, active_side, atr)
             else:
-                print("⏳ Sin señal clara")
+                signal = check_signal(df)
+                if signal:
+                    qty = calculate_qty_full_balance_safe(SYMBOL, LEVERAGE)
+                    active_side = open_position(SYMBOL, signal, qty, atr)
+                else:
+                    print("⏳ Sin señal clara")
+
         except Exception as e:
-            print("⚠️ Error:", e)
+            print("⚠️ Error loop principal:", e)
+
         time.sleep(SLEEP_SECONDS)
+
+
 
 
