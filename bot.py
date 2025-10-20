@@ -12,23 +12,18 @@ API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
 SYMBOL = os.getenv("SYMBOL", "BNBUSDT").upper()
 LEVERAGE = int(os.getenv("LEVERAGE", 10))
-SLEEP_SECONDS = int(os.getenv("SLEEP_SECONDS", 60))
+SLEEP_SECONDS = float(os.getenv("SLEEP_SECONDS", 1))  # 1 segundo para scalping
 
-# Indicadores configurables
-ATR_LEN = int(os.getenv("ATR_LEN", 14))
-ATR_MULT = float(os.getenv("ATR_MULT", 1.0))
-SHORT_EMA = int(os.getenv("SHORT_EMA", 21))
-LONG_EMA = int(os.getenv("LONG_EMA", 65))
-RSI_FAST = int(os.getenv("RSI_FAST", 25))
-RSI_SLOW = int(os.getenv("RSI_SLOW", 100))
-RISK_PCT = float(os.getenv("RISK_PCT", 0.25))  # % del balance a usar por operación
+# Indicadores scalping
+EMA_FAST = 8
+EMA_SLOW = 21
+RSI_PERIOD = 5
+ATR_LEN = 7
+ATR_MULT = 1.2  # Stop/TP factor
 
 # ==============================
 # CLIENTE BINANCE FUTURES
 # ==============================
-if not API_KEY or not API_SECRET:
-    raise EnvironmentError("❌ Faltan claves de Binance. Configura BINANCE_API_KEY y BINANCE_API_SECRET.")
-
 client = Client(API_KEY, API_SECRET)
 
 # ==============================
@@ -43,29 +38,21 @@ def round_price(price, tick):
     precision = max(0, int(round(-math.log10(tick))))
     return round(price, precision)
 
-symbol_rules_cache = {}
 def get_symbol_rules(symbol):
-    if symbol in symbol_rules_cache:
-        return symbol_rules_cache[symbol]
     info = client.futures_exchange_info()
-    s_info = next((s for s in info['symbols'] if s['symbol'] == symbol), None)
-    step_size = float(next(f['stepSize'] for f in s_info['filters'] if f['filterType'] == 'LOT_SIZE'))
-    tick_size = float(next(f['tickSize'] for f in s_info['filters'] if f['filterType'] == 'PRICE_FILTER'))
-    min_notional = float(next(f.get('minNotional', 5.0) for f in s_info['filters'] if f['filterType'] == 'MIN_NOTIONAL'))
-    min_qty = float(next(f['minQty'] for f in s_info['filters'] if f['filterType'] == 'LOT_SIZE'))
-    symbol_rules_cache[symbol] = (step_size, tick_size, min_notional, min_qty)
+    s_info = next((s for s in info['symbols'] if s['symbol']==symbol), None)
+    step_size = float(next(f['stepSize'] for f in s_info['filters'] if f['filterType']=='LOT_SIZE'))
+    tick_size = float(next(f['tickSize'] for f in s_info['filters'] if f['filterType']=='PRICE_FILTER'))
+    min_notional = float(next(f.get('minNotional',5.0) for f in s_info['filters'] if f['filterType']=='MIN_NOTIONAL'))
+    min_qty = float(next(f['minQty'] for f in s_info['filters'] if f['filterType']=='LOT_SIZE'))
     return step_size, tick_size, min_notional, min_qty
 
 def calculate_qty_full_balance(symbol, leverage):
     balances = client.futures_account_balance()
-    usdt_balance = next((float(b['balance']) for b in balances if b['asset'] == 'USDT'), 0.0)
-    if usdt_balance <= 0:
-        print("⚠️ No hay USDT disponible.")
-        return 0.0
+    usdt_balance = next((float(b['balance']) for b in balances if b['asset']=='USDT'),0.0)
     price = float(client.futures_symbol_ticker(symbol=symbol)['price'])
-    usable_balance = usdt_balance * RISK_PCT
-    raw_qty = (usable_balance * leverage) / price
-    step_size, tick_size, _, min_qty = get_symbol_rules(symbol)
+    raw_qty = (usdt_balance * leverage) / price
+    step_size, _, _, min_qty = get_symbol_rules(symbol)
     qty = max(round_step(raw_qty, step_size), min_qty)
     return qty
 
@@ -80,124 +67,112 @@ def get_futures_klines(symbol, interval='1m', limit=200):
     return df
 
 # ==============================
-# CALCULAR INDICADORES Y TENDENCIA
+# CALCULO DE INDICADORES
 # ==============================
 def calculate_indicators(df):
     df = df.copy()
+    df['ema_fast'] = df['close'].ewm(span=EMA_FAST, adjust=False).mean()
+    df['ema_slow'] = df['close'].ewm(span=EMA_SLOW, adjust=False).mean()
     # ATR
     df['hl'] = df['high'] - df['low']
     df['hc'] = (df['high'] - df['close'].shift(1)).abs()
     df['lc'] = (df['low'] - df['close'].shift(1)).abs()
     df['tr'] = df[['hl','hc','lc']].max(axis=1)
     df['atr'] = df['tr'].rolling(ATR_LEN).mean()
-    df['upper_band'] = df['close'] + df['atr'] * ATR_MULT
-    df['lower_band'] = df['close'] - df['atr'] * ATR_MULT
-    # EMA
-    df['ema_short'] = df['close'].ewm(span=SHORT_EMA, adjust=False).mean()
-    df['ema_long'] = df['close'].ewm(span=LONG_EMA, adjust=False).mean()
     # RSI
     delta = df['close'].diff()
     up = delta.clip(lower=0)
     down = -delta.clip(upper=0)
-    roll_up_fast = up.rolling(RSI_FAST).mean()
-    roll_down_fast = down.rolling(RSI_FAST).mean()
-    df['rsi_fast'] = 100 - (100 / (1 + roll_up_fast / roll_down_fast))
-    roll_up_slow = up.rolling(RSI_SLOW).mean()
-    roll_down_slow = down.rolling(RSI_SLOW).mean()
-    df['rsi_slow'] = 100 - (100 / (1 + roll_up_slow / roll_down_slow))
+    roll_up = up.rolling(RSI_PERIOD).mean()
+    roll_down = down.rolling(RSI_PERIOD).mean()
+    df['rsi'] = 100 - (100 / (1 + roll_up / roll_down))
     # Tendencia
     df['trend'] = 'NEUTRAL'
-    df.loc[(df['ema_short'] > df['ema_long']) & (df['rsi_fast'] > df['rsi_slow']), 'trend'] = 'LONG'
-    df.loc[(df['ema_short'] < df['ema_long']) & (df['rsi_fast'] < df['rsi_slow']), 'trend'] = 'SHORT'
+    df.loc[(df['ema_fast']>df['ema_slow']) & (df['rsi']>50), 'trend']='LONG'
+    df.loc[(df['ema_fast']<df['ema_slow']) & (df['rsi']<50), 'trend']='SHORT'
     return df
 
 def check_signals(df):
-    """Detecta señales reales de cambio de tendencia (dos velas)."""
     last = df.iloc[-1]
-    prev = df.iloc[-2]
-    side = None
-    sl = None
-    tp = None
-    if last['trend'] == 'LONG' and prev['trend'] != 'LONG':
-        side = 'LONG'
-        sl = last['low'] - last['atr'] * 2
-        tp = last['high'] + last['atr'] * 4
-    elif last['trend'] == 'SHORT' and prev['trend'] != 'SHORT':
-        side = 'SHORT'
-        sl = last['high'] + last['atr'] * 2
-        tp = last['low'] - last['atr'] * 4
-    return side, sl, tp
+    if last['trend']=='LONG':
+        sl = last['close'] - last['atr']*ATR_MULT
+        tp = last['close'] + last['atr']*ATR_MULT*2
+        return 'LONG', sl, tp
+    elif last['trend']=='SHORT':
+        sl = last['close'] + last['atr']*ATR_MULT
+        tp = last['close'] - last['atr']*ATR_MULT*2
+        return 'SHORT', sl, tp
+    else:
+        return None, None, None
 
 # ==============================
-# POSICIÓN Y APERTURA
+# GESTION DE POSICIONES
 # ==============================
 def get_current_position(symbol):
     pos = client.futures_position_information(symbol=symbol)
     for p in pos:
-        if p['symbol'] == symbol:
+        if p['symbol']==symbol:
             return float(p['positionAmt'])
     return 0.0
 
 def close_opposite_if_needed(symbol, target_side):
     amt = get_current_position(symbol)
-    if amt == 0:
-        return True
-    existing_side = 'LONG' if amt > 0 else 'SHORT'
-    if existing_side == target_side:
-        return True
-    qty = abs(amt)
-    side_for_close = 'SELL' if amt > 0 else 'BUY'
-    client.futures_create_order(symbol=symbol, side=side_for_close, type='MARKET', quantity=qty, reduceOnly=True)
-    time.sleep(1)
+    if amt==0: return True
+    existing_side = 'LONG' if amt>0 else 'SHORT'
+    if existing_side==target_side: return True
+    side_for_close = SIDE_SELL if amt>0 else SIDE_BUY
+    client.futures_create_order(symbol=symbol, side=side_for_close,
+                                type=FUTURE_ORDER_TYPE_MARKET, quantity=abs(amt), reduceOnly=True)
     return True
 
-def open_position_with_tp_sl(symbol, side, sl_price, tp_price):
-    ok = close_opposite_if_needed(symbol, side)
-    if not ok:
-        print("No se cerró posición opuesta, abortando.")
-        return None
+def open_position(symbol, side, sl_price, tp_price):
+    close_opposite_if_needed(symbol, side)
     qty = calculate_qty_full_balance(symbol, LEVERAGE)
-    if qty <= 0:
-        print("⚠️ Qty inválida, abortando.")
+    step_size, tick_size, _, _ = get_symbol_rules(symbol)
+    if qty<=0: 
+        print("⚠️ Qty inválida")
         return None
+
+    # Abrir market
     order = client.futures_create_order(
         symbol=symbol,
         side=SIDE_BUY if side=='LONG' else SIDE_SELL,
         type=FUTURE_ORDER_TYPE_MARKET,
         quantity=qty
     )
-    step_size, tick_size, _, _ = get_symbol_rules(symbol)
-    slp = round_price(sl_price, tick_size)
-    tpp = round_price(tp_price, tick_size)
+
+    # SL
     try:
-        client.futures_create_order(symbol=symbol, side=SIDE_SELL if side=='LONG' else SIDE_BUY,
-                                    type=ORDER_TYPE_STOP_MARKET, stopPrice=slp, reduceOnly=True, quantity=qty)
-    except:
-        print("No se pudo colocar SL")
+        client.futures_create_order(
+            symbol=symbol,
+            side=SIDE_SELL if side=='LONG' else SIDE_BUY,
+            type=ORDER_TYPE_STOP_MARKET,
+            stopPrice=round_price(sl_price, tick_size),
+            quantity=qty,
+            reduceOnly=True
+        )
+    except: print("⚠️ No se pudo colocar SL")
+
+    # TP
     try:
-        client.futures_create_order(symbol=symbol, side=SIDE_SELL if side=='LONG' else SIDE_BUY,
-                                    type=ORDER_TYPE_TAKE_PROFIT_MARKET, stopPrice=tpp, reduceOnly=True, quantity=qty)
-    except:
-        print("No se pudo colocar TP")
+        client.futures_create_order(
+            symbol=symbol,
+            side=SIDE_SELL if side=='LONG' else SIDE_BUY,
+            type=ORDER_TYPE_TAKE_PROFIT_MARKET,
+            stopPrice=round_price(tp_price, tick_size),
+            quantity=qty,
+            reduceOnly=True
+        )
+    except: print("⚠️ No se pudo colocar TP")
+
     return order
 
-def get_potential_profit(symbol, side, sl_price, tp_price, qty):
-    """Calcula ganancia teórica en USDT según posición y TP/SL."""
-    price = float(client.futures_symbol_ticker(symbol=symbol)['price'])
-    if side == 'LONG':
-        potential = (tp_price - price) * qty
-    elif side == 'SHORT':
-        potential = (price - tp_price) * qty
-    else:
-        potential = 0
-    return potential
-
 # ==============================
-# LOOP PRINCIPAL (max profit)
+# LOOP PRINCIPAL SCALPING
 # ==============================
-if __name__ == "__main__":
+if __name__=="__main__":
     client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
-    print(f"🚀 Bot iniciado para {SYMBOL} con apalancamiento x{LEVERAGE}")
+    print(f"🚀 Bot scalping iniciado para {SYMBOL} con apalancamiento x{LEVERAGE}")
 
     current_side = None
     current_qty = 0
@@ -206,39 +181,33 @@ if __name__ == "__main__":
 
     while True:
         try:
-            df = get_futures_klines(SYMBOL)
+            df = get_futures_klines(SYMBOL, interval='1m', limit=200)
             df = calculate_indicators(df)
             signal, sl, tp = check_signals(df)
 
-            if not signal:
-                print("⏳ Sin señal clara en este ciclo.")
-                time.sleep(SLEEP_SECONDS)
-                continue
+            if signal:
+                qty = calculate_qty_full_balance(SYMBOL, LEVERAGE)
+                # Calcula ganancia potencial simple
+                price_now = float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
+                potential_new = (tp - price_now)*qty if signal=='LONG' else (price_now - tp)*qty
+                potential_current = (current_tp - price_now)*current_qty if current_side=='LONG' else (price_now - current_tp)*current_qty if current_side else 0
 
-            qty = calculate_qty_full_balance(SYMBOL, LEVERAGE)
-            potential_new = get_potential_profit(SYMBOL, signal, sl, tp, qty)
-            potential_current = 0
-            if current_side:
-                potential_current = get_potential_profit(SYMBOL, current_side, current_sl, current_tp, current_qty)
-
-            if potential_new > potential_current:
-                print(f"🔄 Cambiando posición → {signal} (mayor ganancia potencial)")
-                close_opposite_if_needed(SYMBOL, signal)
-                order = open_position_with_tp_sl(SYMBOL, signal, sl, tp)
-                if order:
-                    current_side = signal
-                    current_qty = qty
-                    current_sl = sl
-                    current_tp = tp
-                    print(f"✅ Posición {signal} abierta correctamente.")
+                if potential_new>potential_current:
+                    print(f"🔄 Cambiando/abriendo posición: {signal}")
+                    order = open_position(SYMBOL, signal, sl, tp)
+                    if order:
+                        current_side = signal
+                        current_qty = qty
+                        current_sl = sl
+                        current_tp = tp
+                        print(f"✅ Posición {signal} abierta correctamente")
                 else:
-                    print("⚠️ No se pudo abrir la posición.")
+                    print(f"⏳ Manteniendo posición {current_side}")
             else:
-                print(f"📉 Manteniendo posición {current_side} (mayor ganancia actual)")
+                print("⏳ Sin señal clara")
 
         except Exception as e:
             print(f"⚠️ Error inesperado: {e}")
 
         time.sleep(SLEEP_SECONDS)
-
 
