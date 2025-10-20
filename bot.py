@@ -110,6 +110,19 @@ def check_signal(df):
     return signal
 
 # ==============================
+# ORDENES
+# ==============================
+def cancel_all_open_orders(symbol):
+    try:
+        open_orders = client.futures_get_open_orders(symbol=symbol)
+        for order in open_orders:
+            client.futures_cancel_order(symbol=symbol, orderId=order['orderId'])
+        if open_orders:
+            print(f"🧹 Canceladas {len(open_orders)} órdenes abiertas previas")
+    except Exception as e:
+        print(f"⚠️ Error cancelando órdenes: {e}")
+
+# ==============================
 # POSICIONES
 # ==============================
 def get_current_position(symbol):
@@ -131,7 +144,6 @@ def manage_trailing_stop(symbol, side, atr):
     price = float(client.futures_symbol_ticker(symbol=symbol)['price'])
     step_size, tick_size, _, _ = get_symbol_rules(symbol)
 
-    # Trailing SL
     if side == 'LONG':
         new_sl = price - TRAILING_SL_STEP * atr
         new_sl = round_price(new_sl, tick_size)
@@ -165,6 +177,8 @@ def open_position(symbol, side, qty, atr):
     if is_position_open(symbol):
         print("⚠️ Ya hay posición abierta. Esperando cierre...")
         return None
+
+    cancel_all_open_orders(symbol)  # Cancela órdenes previas
 
     price = float(client.futures_symbol_ticker(symbol=symbol)['price'])
     step_size, tick_size, _, _ = get_symbol_rules(symbol)
@@ -214,7 +228,6 @@ if __name__ == "__main__":
             df = calculate_indicators(df)
             atr = df['atr'].iloc[-1]
 
-            # Si hay posición activa, ajustar trailing SL
             if is_position_open(SYMBOL) and active_side:
                 manage_trailing_stop(SYMBOL, active_side, atr)
             else:
@@ -229,7 +242,4 @@ if __name__ == "__main__":
             print("⚠️ Error loop principal:", e)
 
         time.sleep(SLEEP_SECONDS)
-
-
-
 
