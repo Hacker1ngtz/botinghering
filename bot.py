@@ -5,160 +5,92 @@ import numpy as np
 from binance import AsyncClient, BinanceSocketManager
 from binance.enums import *
 from dotenv import load_dotenv
-import sys
-from colorama import init, Fore
 from datetime import datetime
 
-# ---------- INICIALIZACIÓN ----------
+# ===== Cargar variables de entorno =====
 load_dotenv()
-init(autoreset=True)
-
-# ---------- CONFIG ----------
-API_KEY = os.getenv("BINANCE_API_KEY")
-API_SECRET = os.getenv("BINANCE_API_SECRET")
-
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
+TRADE_AMOUNT = float(os.getenv("TRADE_AMOUNT", 0))
+TRADE_QUANTITY = float(os.getenv("TRADE_QUANTITY", 0))
+PIVOT_PERIOD = int(os.getenv("PIVOT_PERIOD", 16))
+PIPS = int(os.getenv("PIPS", 64))
+SPREAD = int(os.getenv("SPREAD", 0))
 SYMBOL = "WALUSDT"
-INTERVAL = "30s"  # scalping ultra rápido
-EMA_FAST = 25
-EMA_SLOW = 100
-PIPS = 64
-QTY = 10
+TIMEFRAME = "1m"  # Velas de 1 minuto, puedes cambiar
 
-PIVOT_LEFT = 5
-PIVOT_RIGHT = 5
+# ===== Funciones de estrategia =====
+def calculate_ema(prices, period):
+    return prices.ewm(span=period, adjust=False).mean()
 
-# ---------- LOGS ----------
-def timestamp():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def pivot_high(df, period):
+    return df['high'].rolling(window=period, center=True).max()
 
-def log_info(msg):
-    print(Fore.CYAN + f"{timestamp()} ℹ️ {msg}")
+def pivot_low(df, period):
+    return df['low'].rolling(window=period, center=True).min()
 
-def log_success(msg):
-    print(Fore.GREEN + f"{timestamp()} ✅ {msg}")
-
-def log_warning(msg):
-    print(Fore.YELLOW + f"{timestamp()} ⚠️ {msg}")
-
-def log_error(msg):
-    print(Fore.RED + f"{timestamp()} ❌ {msg}", file=sys.stderr)
-
-# ---------- FUNCIONES ----------
-async def send_order(client, side, qty, tp, sl):
-    try:
-        log_success(f"🟢 {side} | TP {tp:.4f} | SL {sl:.4f}")
-        await client.create_order(
-            symbol=SYMBOL,
-            side=side,
-            type=ORDER_TYPE_MARKET,
-            quantity=qty
-        )
-        if side == SIDE_BUY:
-            await client.create_oco_order(
-                symbol=SYMBOL,
-                side=SIDE_SELL,
-                quantity=qty,
-                price=str(round(tp, 4)),
-                stopPrice=str(round(sl, 4)),
-                stopLimitPrice=str(round(sl, 4)),
-                stopLimitTimeInForce=TIME_IN_FORCE_GTC
-            )
-        elif side == SIDE_SELL:
-            await client.create_oco_order(
-                symbol=SYMBOL,
-                side=SIDE_BUY,
-                quantity=qty,
-                price=str(round(tp, 4)),
-                stopPrice=str(round(sl, 4)),
-                stopLimitPrice=str(round(sl, 4)),
-                stopLimitTimeInForce=TIME_IN_FORCE_GTC
-            )
-    except Exception as e:
-        log_error(f"⚠️ Error al enviar orden: {e}")
-
-def calculate_indicators(df):
-    df['ema_fast'] = df['close'].ewm(span=EMA_FAST).mean()
-    df['ema_slow'] = df['close'].ewm(span=EMA_SLOW).mean()
-    df['trend'] = np.where(df['ema_fast'] > df['ema_slow'], 1, -1)
+async def fetch_klines(client, symbol, interval, limit=500):
+    klines = await client.get_klines(symbol=symbol, interval=interval, limit=limit)
+    df = pd.DataFrame(klines, columns=[
+        'open_time','open','high','low','close','volume','close_time','quote_av','trades','tb_base_av','tb_quote_av','ignore'
+    ])
+    df['open'] = df['open'].astype(float)
+    df['high'] = df['high'].astype(float)
+    df['low'] = df['low'].astype(float)
+    df['close'] = df['close'].astype(float)
     return df
 
-def detect_pivots(df, left=PIVOT_LEFT, right=PIVOT_RIGHT):
-    pivots_high = [np.nan]*len(df)
-    pivots_low  = [np.nan]*len(df)
-    for i in range(left, len(df)-right):
-        window_high = df['high'].iloc[i-left:i+right+1]
-        if df['high'].iloc[i] == window_high.max():
-            pivots_high[i] = df['high'].iloc[i]
-        window_low = df['low'].iloc[i-left:i+right+1]
-        if df['low'].iloc[i] == window_low.min():
-            pivots_low[i] = df['low'].iloc[i]
-    df['pivot_high'] = pivots_high
-    df['pivot_low'] = pivots_low
-    return df
+# ===== Estrategia de scalping =====
+def check_signals(df):
+    df['ema100'] = calculate_ema(df['close'], 100)
+    df['ema25'] = calculate_ema(df['close'], 25)
+    df['ph'] = pivot_high(df, PIVOT_PERIOD)
+    df['pl'] = pivot_low(df, PIVOT_PERIOD)
 
-# ---------- BOT SCALPING 30s ----------
+    last_row = df.iloc[-1]
+    prev_row = df.iloc[-2]
+
+    # Señal de compra
+    if last_row['ema25'] > last_row['ema100'] and prev_row['close'] < prev_row['ph'] and last_row['close'] > last_row['ph']:
+        return "BUY"
+    # Señal de venta
+    if last_row['ema25'] < last_row['ema100'] and prev_row['close'] > prev_row['pl'] and last_row['close'] < last_row['pl']:
+        return "SELL"
+    return None
+
+# ===== Función principal =====
 async def main():
     client = await AsyncClient.create(API_KEY, API_SECRET)
-    bm = BinanceSocketManager(client)
-    socket = bm.kline_socket(symbol=SYMBOL, interval=INTERVAL)
-    
-    df = pd.DataFrame(columns=["open","high","low","close"])
-    position_open = None
+    bsm = BinanceSocketManager(client)
 
-    try:
-        log_success(f"🚀 Bot scalping ultra rápido activo en {SYMBOL} (30s)")
-        async with socket as s:
-            while True:
-                msg = await s.recv()
-                k = msg['k']
+    print(f"🚀 Bot scalping realtime activo en {SYMBOL}")
 
-                # Log de cada vela
-                log_info(f"Vela: open={k['o']} high={k['h']} low={k['l']} close={k['c']} finalizada={k['x']}")
+    while True:
+        try:
+            # Obtener velas recientes
+            df = await fetch_klines(client, SYMBOL, TIMEFRAME, limit=500)
+            signal = check_signals(df)
+            price = float(df['close'].iloc[-1])
+            print(f"{datetime.now()} - Precio: {price} - Señal: {signal}")
 
-                close = float(k['c'])
-                high = float(k['h'])
-                low = float(k['l'])
-                openp = float(k['o'])
+            if signal == "BUY":
+                # Aquí colocas tu orden de compra
+                print(f"📈 Ejecutar BUY - Cantidad: {TRADE_QUANTITY}")
+                # await client.create_order(symbol=SYMBOL, side=SIDE_BUY, type=ORDER_TYPE_MARKET, quantity=TRADE_QUANTITY)
 
-                df.loc[len(df)] = [openp, high, low, close]
-                df = df.tail(500)
+            elif signal == "SELL":
+                # Aquí colocas tu orden de venta
+                print(f"📉 Ejecutar SELL - Cantidad: {TRADE_QUANTITY}")
+                # await client.create_order(symbol=SYMBOL, side=SIDE_SELL, type=ORDER_TYPE_MARKET, quantity=TRADE_QUANTITY)
 
-                if len(df) > 10:  # rápido para pruebas
-                    df = calculate_indicators(df)
-                    df = detect_pivots(df)
-                    trend = df['trend'].iloc[-1]
+            # Esperar 1 minuto antes de la siguiente verificación
+            await asyncio.sleep(60)
 
-                    last_high = df['pivot_high'].dropna().iloc[-1] if not df['pivot_high'].dropna().empty else close-1
-                    last_low  = df['pivot_low'].dropna().iloc[-1]  if not df['pivot_low'].dropna().empty else close+1
+        except Exception as e:
+            print(f"⚠ Error: {e}, reconectando en 5 segundos...")
+            await asyncio.sleep(5)
 
-                    # Entradas scalping ultra rápido
-                    if trend == 1 and position_open != SIDE_BUY:
-                        tp = close + (PIPS * 0.0001)
-                        sl = close - (PIPS * 0.0001)
-                        await send_order(client, SIDE_BUY, QTY, tp, sl)
-                        position_open = SIDE_BUY
+    await client.close_connection()
 
-                    elif trend == -1 and position_open != SIDE_SELL:
-                        tp = close - (PIPS * 0.0001)
-                        sl = close + (PIPS * 0.0001)
-                        await send_order(client, SIDE_SELL, QTY, tp, sl)
-                        position_open = SIDE_SELL
-
-                    # Cierre de posición si cambia tendencia
-                    if position_open == SIDE_BUY and trend == -1:
-                        position_open = None
-                    elif position_open == SIDE_SELL and trend == 1:
-                        position_open = None
-
-    finally:
-        await client.close_connection()
-        log_warning("🛑 Conexión Binance cerrada.")
-
-# ---------- RUN ----------
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        log_warning("🛑 Bot detenido manualmente.")
-
-
+    asyncio.run(main())
