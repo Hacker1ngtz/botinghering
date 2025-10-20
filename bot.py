@@ -224,4 +224,3 @@ if __name__ == "__main__":
             print(f"⚠️ Error en loop: {e}")
         time.sleep(SLEEP_SECONDS)
 
-
