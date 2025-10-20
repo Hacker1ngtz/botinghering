@@ -13,7 +13,7 @@ API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
 SYMBOL = os.getenv("SYMBOL", "ETHUSDT").upper()
 LEVERAGE = int(os.getenv("LEVERAGE", 10))
-SLEEP_SECONDS = int(os.getenv("SLEEP_SECONDS", 5))  # loop rápido para reaccionar a ticks
+SLEEP_SECONDS = int(os.getenv("SLEEP_SECONDS", 5))
 
 # Indicadores
 ATR_LEN = int(os.getenv("ATR_LEN", 14))
@@ -24,7 +24,7 @@ RSI_FAST = int(os.getenv("RSI_FAST", 25))
 RSI_SLOW = int(os.getenv("RSI_SLOW", 100))
 
 # ------------------------------
-# Cliente Binance Futures (real)
+# Cliente Binance Futures
 # ------------------------------
 client = Client(API_KEY, API_SECRET)
 
@@ -163,26 +163,25 @@ def close_opposite_if_needed(symbol, target_side):
         return False
 
 # ------------------------------
-# Calcular cantidad
+# Calcular cantidad (usa TODO el saldo)
 # ------------------------------
 def calculate_qty_full_balance(symbol, leverage):
     try:
         balances = client.futures_account_balance()
-        usdt_balance = 0.0
-        for b in balances:
-            if b['asset'] == 'USDT':
-                usdt_balance = float(b.get('balance', 0.0))
-                break
+        usdt_balance = next((float(b['balance']) for b in balances if b['asset'] == 'USDT'), 0.0)
+
         if usdt_balance <= 0:
-            print("Balance USDT vacío.")
+            print("⚠️ No hay USDT disponible en la cuenta de Futuros.")
             return 0.0
 
         price = float(client.futures_symbol_ticker(symbol=symbol)['price'])
-        raw_notional = usdt_balance * leverage
-        raw_qty = raw_notional / price
-        step_size, tick_size, min_notional, min_qty = get_symbol_rules(symbol)
-        qty = round_step(raw_qty, step_size)
+        qty = (usdt_balance * leverage) / price  # usa TODO el saldo disponible
+
+        step_size, tick_size, _, min_qty = get_symbol_rules(symbol)
+        qty = max(round_step(qty, step_size), min_qty)
+        print(f"💰 Usando todo el balance ({usdt_balance} USDT) → qty={qty}")
         return qty
+
     except Exception as e:
         print("Error calculate_qty_full_balance:", e)
         return 0.0
@@ -198,12 +197,12 @@ def open_position_with_tp_sl(symbol, side, sl_price, tp_price):
 
     qty = calculate_qty_full_balance(symbol, LEVERAGE)
     if qty <= 0:
-        print("Qty inválida, abortando.")
+        print("⚠️ No se pudo calcular cantidad válida. Esperando próximo ciclo...")
         return None
 
     try:
         order = client.futures_create_order(symbol=symbol, side='BUY' if side=='LONG' else 'SELL', type='MARKET', quantity=qty)
-        print(f"Abrida posición {side} qty={qty} orderId={order.get('orderId')}")
+        print(f"📈 Posición {side} abierta qty={qty} orderId={order.get('orderId')}")
 
         step_size, tick_size, _, _ = get_symbol_rules(symbol)
         slp = round_price(sl_price, tick_size)
@@ -212,14 +211,14 @@ def open_position_with_tp_sl(symbol, side, sl_price, tp_price):
         try:
             client.futures_create_order(symbol=symbol, side='SELL' if side=='LONG' else 'BUY',
                                         type='STOP_MARKET', stopPrice=slp, reduceOnly=True, quantity=qty)
-            print(f"SL colocado en {slp}")
+            print(f"🛑 SL colocado en {slp}")
         except Exception as e:
             print("No se pudo colocar SL:", e)
 
         try:
             client.futures_create_order(symbol=symbol, side='SELL' if side=='LONG' else 'BUY',
                                         type='TAKE_PROFIT_MARKET', stopPrice=tpp, reduceOnly=True, quantity=qty)
-            print(f"TP colocado en {tpp}")
+            print(f"🎯 TP colocado en {tpp}")
         except Exception as e:
             print("No se pudo colocar TP:", e)
 
@@ -238,7 +237,7 @@ if __name__ == "__main__":
     except Exception as e:
         print("Warning: no se pudo establecer apalancamiento:", e)
 
-    print("Bot iniciado — MERCADO REAL (Futures). Símbolo:", SYMBOL)
+    print("🚀 Bot iniciado — MERCADO REAL (Futures). Símbolo:", SYMBOL)
 
     while True:
         df = get_futures_klines(SYMBOL, interval='1m', limit=200)
@@ -251,13 +250,12 @@ if __name__ == "__main__":
         signal, sl, tp = check_signals(df)
 
         if signal == 'LONG':
-            print("Señal LONG detectada. Intentando abrir posición con TP/SL...")
+            print("📊 Señal LONG detectada. Intentando abrir posición con TP/SL...")
             open_position_with_tp_sl(SYMBOL, 'LONG', sl, tp)
         elif signal == 'SHORT':
-            print("Señal SHORT detectada. Intentando abrir posición con TP/SL...")
+            print("📊 Señal SHORT detectada. Intentando abrir posición con TP/SL...")
             open_position_with_tp_sl(SYMBOL, 'SHORT', sl, tp)
         else:
-            print("No hay señales en este ciclo")
+            print("⏳ No hay señales en este ciclo.")
 
         time.sleep(SLEEP_SECONDS)
-
