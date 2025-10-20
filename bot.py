@@ -37,45 +37,6 @@ async def send_order(client, side, qty, tp, sl):
         )
         # Crear orden OCO TP/SL
         if side == SIDE_BUY:
-            await client.create_oco_order(import os, asyncio, pandas as pd, numpy as np
-from binance import AsyncClient, BinanceSocketManager
-from binance.enums import *
-from dotenv import load_dotenv
-
-load_dotenv()
-
-# ================= CONFIG =================
-API_KEY = os.getenv("BINANCE_API_KEY")
-API_SECRET = os.getenv("BINANCE_API_SECRET")
-
-SYMBOL = "WALUSDT"
-INTERVAL = "1m"
-EMA_FAST = 25
-EMA_SLOW = 100
-PIPS = 64
-QTY = 10
-
-# Tiempo para pivot lookback
-PIVOT_LEFT = 3
-PIVOT_RIGHT = 3
-
-# ================= FUNCIONES =================
-
-async def send_order(client, side, qty, tp, sl):
-    """
-    Crea orden de mercado y TP/SL OCO.
-    """
-    try:
-        print(f"🟢 {side} | TP {tp:.4f} | SL {sl:.4f}")
-        # Crear orden de mercado
-        order = await client.create_order(
-            symbol=SYMBOL,
-            side=side,
-            type=ORDER_TYPE_MARKET,
-            quantity=qty
-        )
-        # Crear orden OCO TP/SL
-        if side == SIDE_BUY:
             await client.create_oco_order(
                 symbol=SYMBOL,
                 side=SIDE_SELL,
@@ -104,11 +65,24 @@ def calculate_indicators(df):
     df['trend'] = np.where(df['ema_fast'] > df['ema_slow'], 1, -1)
     return df
 
-def get_last_pivots(df):
-    """Devuelve último pivot alto y bajo simples."""
-    last_high = df["high"].iloc[-PIVOT_LEFT-1:-1].max() if len(df) > PIVOT_LEFT+1 else None
-    last_low = df["low"].iloc[-PIVOT_LEFT-1:-1].min() if len(df) > PIVOT_LEFT+1 else None
-    return last_high, last_low
+def detect_pivots(df, left=PIVOT_LEFT, right=PIVOT_RIGHT):
+    """
+    Detecta pivotes altos y bajos locales.
+    """
+    pivots_high = [np.nan]*len(df)
+    pivots_low  = [np.nan]*len(df)
+    
+    for i in range(left, len(df)-right):
+        window_high = df['high'].iloc[i-left:i+right+1]
+        if df['high'].iloc[i] == window_high.max():
+            pivots_high[i] = df['high'].iloc[i]
+        window_low = df['low'].iloc[i-left:i+right+1]
+        if df['low'].iloc[i] == window_low.min():
+            pivots_low[i] = df['low'].iloc[i]
+    
+    df['pivot_high'] = pivots_high
+    df['pivot_low'] = pivots_low
+    return df
 
 # ================= STRATEGY REALTIME =================
 async def main():
@@ -136,17 +110,21 @@ async def main():
 
                     if len(df) > EMA_SLOW:
                         df = calculate_indicators(df)
+                        df = detect_pivots(df)
                         trend = df['trend'].iloc[-1]
-                        last_high, last_low = get_last_pivots(df)
 
-                        # --- Lógica de entradas ---
-                        if trend == 1 and close > last_high and position_open != SIDE_BUY:
+                        # Últimos pivotes válidos
+                        last_high = df['pivot_high'].dropna().iloc[-1] if not df['pivot_high'].dropna().empty else None
+                        last_low  = df['pivot_low'].dropna().iloc[-1]  if not df['pivot_low'].dropna().empty else None
+
+                        # --- Entradas ---
+                        if trend == 1 and last_high and close > last_high and position_open != SIDE_BUY:
                             tp = close + (PIPS * 0.0001)
                             sl = close - (PIPS * 0.0001)
                             await send_order(client, SIDE_BUY, QTY, tp, sl)
                             position_open = SIDE_BUY
 
-                        elif trend == -1 and close < last_low and position_open != SIDE_SELL:
+                        elif trend == -1 and last_low and close < last_low and position_open != SIDE_SELL:
                             tp = close - (PIPS * 0.0001)
                             sl = close + (PIPS * 0.0001)
                             await send_order(client, SIDE_SELL, QTY, tp, sl)
@@ -161,13 +139,6 @@ async def main():
     finally:
         await client.close_connection()
         print("🛑 Conexión Binance cerrada.")
-
-# ================= RUN BOT =================
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("🛑 Bot detenido manualmente.")
 
 # ================= RUN BOT =================
 if __name__ == "__main__":
