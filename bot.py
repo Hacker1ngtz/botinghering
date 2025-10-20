@@ -1,11 +1,19 @@
-import os, asyncio, pandas as pd, numpy as np
+import os
+import asyncio
+import pandas as pd
+import numpy as np
 from binance import AsyncClient, BinanceSocketManager
 from binance.enums import *
 from dotenv import load_dotenv
+import sys
+from colorama import init, Fore, Style
+from datetime import datetime
 
+# ---------- INICIALIZACIÓN ----------
 load_dotenv()
+init(autoreset=True)  # Colorama para colores en consola
 
-# ================= CONFIG =================
+# ---------- CONFIG ----------
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
 
@@ -20,22 +28,33 @@ QTY = 10
 PIVOT_LEFT = 5
 PIVOT_RIGHT = 5
 
-# ================= FUNCIONES =================
+# ---------- FUNCIONES DE LOG ----------
+def timestamp():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+def log_info(msg):
+    print(Fore.CYAN + f"{timestamp()} ℹ️ {msg}")
+
+def log_success(msg):
+    print(Fore.GREEN + f"{timestamp()} ✅ {msg}")
+
+def log_warning(msg):
+    print(Fore.YELLOW + f"{timestamp()} ⚠️ {msg}")
+
+def log_error(msg):
+    print(Fore.RED + f"{timestamp()} ❌ {msg}", file=sys.stderr)
+
+# ---------- FUNCIONES DEL BOT ----------
 async def send_order(client, side, qty, tp, sl):
-    """
-    Crea orden de mercado y TP/SL OCO.
-    """
+    """Crea orden de mercado y TP/SL OCO"""
     try:
-        print(f"🟢 {side} | TP {tp:.4f} | SL {sl:.4f}")
-        # Crear orden de mercado
+        log_success(f"🟢 {side} | TP {tp:.4f} | SL {sl:.4f}")
         order = await client.create_order(
             symbol=SYMBOL,
             side=side,
             type=ORDER_TYPE_MARKET,
             quantity=qty
         )
-        # Crear orden OCO TP/SL
         if side == SIDE_BUY:
             await client.create_oco_order(
                 symbol=SYMBOL,
@@ -57,7 +76,7 @@ async def send_order(client, side, qty, tp, sl):
                 stopLimitTimeInForce=TIME_IN_FORCE_GTC
             )
     except Exception as e:
-        print(f"⚠️ Error al enviar orden: {e}")
+        log_error(f"⚠️ Error al enviar orden: {e}")
 
 def calculate_indicators(df):
     df['ema_fast'] = df['close'].ewm(span=EMA_FAST).mean()
@@ -66,12 +85,8 @@ def calculate_indicators(df):
     return df
 
 def detect_pivots(df, left=PIVOT_LEFT, right=PIVOT_RIGHT):
-    """
-    Detecta pivotes altos y bajos locales.
-    """
     pivots_high = [np.nan]*len(df)
     pivots_low  = [np.nan]*len(df)
-    
     for i in range(left, len(df)-right):
         window_high = df['high'].iloc[i-left:i+right+1]
         if df['high'].iloc[i] == window_high.max():
@@ -79,22 +94,21 @@ def detect_pivots(df, left=PIVOT_LEFT, right=PIVOT_RIGHT):
         window_low = df['low'].iloc[i-left:i+right+1]
         if df['low'].iloc[i] == window_low.min():
             pivots_low[i] = df['low'].iloc[i]
-    
     df['pivot_high'] = pivots_high
     df['pivot_low'] = pivots_low
     return df
 
-# ================= STRATEGY REALTIME =================
+# ---------- STRATEGY REALTIME ----------
 async def main():
     client = await AsyncClient.create(API_KEY, API_SECRET)
     bm = BinanceSocketManager(client)
     socket = bm.kline_socket(symbol=SYMBOL, interval=INTERVAL)
     
     df = pd.DataFrame(columns=["open","high","low","close"])
-    position_open = None  # trackea posición abierta
+    position_open = None  # Trackea posición abierta
 
     try:
-        print(f"🚀 Bot scalping realtime activo en {SYMBOL}")
+        log_success(f"🚀 Bot scalping realtime activo en {SYMBOL}")
         async with socket as s:
             while True:
                 msg = await s.recv()
@@ -138,11 +152,11 @@ async def main():
 
     finally:
         await client.close_connection()
-        print("🛑 Conexión Binance cerrada.")
+        log_warning("🛑 Conexión Binance cerrada.")
 
-# ================= RUN BOT =================
+# ---------- RUN BOT ----------
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("🛑 Bot detenido manualmente.")
+        log_warning("🛑 Bot detenido manualmente.")
