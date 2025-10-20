@@ -1,3 +1,4 @@
+# bot.py
 import os
 import time
 import math
@@ -6,15 +7,15 @@ from binance.client import Client
 from binance.enums import *
 
 # ==============================
-# CONFIGURACIÓN DESDE VARIABLES DE ENTORNO
+# VARIABLES DE ENTORNO
 # ==============================
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
-SYMBOL = os.getenv("SYMBOL", "BNBUSDT").upper()  # <-- Cambia aquí tu moneda
+SYMBOL = os.getenv("SYMBOL", "BNBUSDT").upper()  # Cambia aquí tu moneda
 LEVERAGE = int(os.getenv("LEVERAGE", 10))
 SLEEP_SECONDS = int(os.getenv("SLEEP_SECONDS", 60))
 
-# Indicadores
+# Indicadores configurables
 ATR_LEN = int(os.getenv("ATR_LEN", 14))
 ATR_MULT = float(os.getenv("ATR_MULT", 1.0))
 SHORT_EMA = int(os.getenv("SHORT_EMA", 21))
@@ -177,12 +178,15 @@ if __name__ == "__main__":
     client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
     print(f"🚀 Bot iniciado para {SYMBOL} con apalancamiento x{LEVERAGE}")
     while True:
-        df = get_futures_klines(SYMBOL)
-        df = calculate_indicators(df)
-        signal, sl, tp = check_signals(df)
-        if signal:
-            print(f"Señal {signal} detectada. Abrir posición con TP/SL...")
-            open_position_with_tp_sl(SYMBOL, signal, sl, tp)
-        else:
-            print("No hay señal clara en este ciclo")
+        try:
+            df = get_futures_klines(SYMBOL)
+            df = calculate_indicators(df)
+            signal, sl, tp = check_signals(df)
+            if signal:
+                print(f"Señal {signal} detectada. Abrir posición con TP/SL...")
+                open_position_with_tp_sl(SYMBOL, signal, sl, tp)
+            else:
+                print("⏳ No hay señal clara en este ciclo")
+        except Exception as e:
+            print(f"⚠️ Error inesperado: {e}")
         time.sleep(SLEEP_SECONDS)
