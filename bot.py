@@ -13,9 +13,9 @@ API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
 SYMBOL = os.getenv("SYMBOL", "ETHUSDT").upper()
 LEVERAGE = int(os.getenv("LEVERAGE", 10))
-SLEEP_SECONDS = int(os.getenv("SLEEP_SECONDS", 60))
+SLEEP_SECONDS = int(os.getenv("SLEEP_SECONDS", 5))  # loop rápido para reaccionar a ticks
 
-# Indicadores (opcionales)
+# Indicadores
 ATR_LEN = int(os.getenv("ATR_LEN", 14))
 ATR_MULT = float(os.getenv("ATR_MULT", 1.0))
 SHORT_EMA = int(os.getenv("SHORT_EMA", 21))
@@ -29,7 +29,7 @@ RSI_SLOW = int(os.getenv("RSI_SLOW", 100))
 client = Client(API_KEY, API_SECRET)
 
 # ------------------------------
-# Helpers: market data, filters
+# Helpers
 # ------------------------------
 def get_futures_klines(symbol, interval='1m', limit=200):
     try:
@@ -46,15 +46,12 @@ def get_futures_klines(symbol, interval='1m', limit=200):
         return None
 
 def get_symbol_rules(symbol):
-    """Devuelve (stepSize, tickSize, minNotional, minQty) del symbol en futures"""
     try:
         info = client.futures_exchange_info()
         for s in info.get('symbols', []):
             if s['symbol'] == symbol:
-                step_size = 0.0
-                tick_size = 0.0
-                min_notional = None
-                min_qty = None
+                step_size = tick_size = 0.0
+                min_notional = min_qty = None
                 for f in s.get('filters', []):
                     if f.get('filterType') == 'LOT_SIZE':
                         step_size = float(f.get('stepSize', 0.0))
@@ -62,35 +59,23 @@ def get_symbol_rules(symbol):
                     if f.get('filterType') == 'PRICE_FILTER':
                         tick_size = float(f.get('tickSize', 0.0))
                     if f.get('filterType') == 'MIN_NOTIONAL':
-                        # some APIs use 'notional' key, some 'minNotional'
                         min_notional = float(f.get('notional', f.get('minNotional', 0.0)))
-                # defaults
-                if step_size == 0.0: step_size = 0.00000001
-                if tick_size == 0.0: tick_size = 0.00000001
-                if min_notional is None: min_notional = 5.0
-                if min_qty is None: min_qty = 0.0
-                return step_size, tick_size, min_notional, min_qty
+                return step_size or 0.00000001, tick_size or 0.00000001, min_notional or 5.0, min_qty or 0.0
     except Exception as e:
         print("Error al obtener symbol rules:", e)
-    # fallback
     return 0.00000001, 0.00000001, 5.0, 0.0
 
 def round_step(quantity, step):
-    """Redondea hacia abajo a múltiplo de step"""
-    if step <= 0:
-        return quantity
     precision = max(0, int(round(-math.log10(step))))
     qty = math.floor(quantity / step) * step
     return round(qty, precision)
 
 def round_price(price, tick):
-    if tick <= 0:
-        return price
     precision = max(0, int(round(-math.log10(tick))))
     return round(price, precision)
 
 # ------------------------------
-# Indicadores: ATR, EMA, RSI doble
+# Indicadores
 # ------------------------------
 def calculate_indicators(df):
     df = df.copy()
@@ -125,7 +110,7 @@ def calculate_indicators(df):
     return df
 
 # ------------------------------
-# Señales similares al Pine original
+# Señales
 # ------------------------------
 def check_signals(df):
     row = df.iloc[-1]
@@ -151,17 +136,16 @@ def get_current_position(symbol):
         for p in pos:
             if p['symbol'] == symbol:
                 amt = float(p['positionAmt'])
-                entry = float(p.get('entryPrice', 0.0))
-                return amt, entry
+                return amt
     except Exception as e:
         print("Error get_current_position:", e)
-    return 0.0, 0.0
+    return 0.0
 
 # ------------------------------
-# Cerrar opuesta (reduceOnly market)
+# Cerrar opuesta
 # ------------------------------
 def close_opposite_if_needed(symbol, target_side):
-    amt, entry = get_current_position(symbol)
+    amt = get_current_position(symbol)
     if amt == 0:
         return True
     existing_side = 'LONG' if amt > 0 else 'SHORT'
@@ -169,7 +153,6 @@ def close_opposite_if_needed(symbol, target_side):
         return True
     qty = abs(amt)
     try:
-        # reduceOnly market to close
         side_for_close = 'SELL' if amt > 0 else 'BUY'
         client.futures_create_order(symbol=symbol, side=side_for_close, type='MARKET', quantity=qty, reduceOnly=True)
         print(f"Cerrada posición opuesta ({existing_side}) qty={qty}")
@@ -180,11 +163,10 @@ def close_opposite_if_needed(symbol, target_side):
         return False
 
 # ------------------------------
-# Calcular quantity usando 100% balance * leverage
+# Calcular cantidad
 # ------------------------------
 def calculate_qty_full_balance(symbol, leverage):
     try:
-        # obtener USDT balance (futures)
         balances = client.futures_account_balance()
         usdt_balance = 0.0
         for b in balances:
@@ -198,38 +180,17 @@ def calculate_qty_full_balance(symbol, leverage):
         price = float(client.futures_symbol_ticker(symbol=symbol)['price'])
         raw_notional = usdt_balance * leverage
         raw_qty = raw_notional / price
-
         step_size, tick_size, min_notional, min_qty = get_symbol_rules(symbol)
         qty = round_step(raw_qty, step_size)
-        notional = qty * price
-
-        # intentar asegurar min_notional
-        if notional < min_notional:
-            # incrementar por steps hasta superar min_notional, pero cuidado con overflow
-            steps = math.ceil((min_notional - notional) / (price * step_size)) if step_size>0 else 0
-            qty = qty + steps * step_size
-            qty = round_step(qty, step_size)
-            notional = qty * price
-
-        if qty < min_qty:
-            qty = min_qty
-            qty = round_step(qty, step_size)
-            notional = qty * price
-
-        if qty <= 0 or notional < min_notional:
-            print(f"No se pudo calcular qty válida. notional={notional} min_notional={min_notional}")
-            return 0.0
-
         return qty
     except Exception as e:
         print("Error calculate_qty_full_balance:", e)
         return 0.0
 
 # ------------------------------
-# Abrir posición market + crear TP y SL reduceOnly
+# Abrir posición
 # ------------------------------
 def open_position_with_tp_sl(symbol, side, sl_price, tp_price):
-    # cerrar opuesta si aplica
     ok = close_opposite_if_needed(symbol, side)
     if not ok:
         print("No se cerró posición opuesta, abortando apertura.")
@@ -241,46 +202,24 @@ def open_position_with_tp_sl(symbol, side, sl_price, tp_price):
         return None
 
     try:
-        # abrir market
         order = client.futures_create_order(symbol=symbol, side='BUY' if side=='LONG' else 'SELL', type='MARKET', quantity=qty)
-        order_id = order.get('orderId')
-        print(f"Abrida posición {side} qty={qty} orderId={order_id}")
+        print(f"Abrida posición {side} qty={qty} orderId={order.get('orderId')}")
 
-        # obtener tick y step para redondeos
-        step_size, tick_size, min_notional, min_qty = get_symbol_rules(symbol)
-
-        # redondear SL y TP
+        step_size, tick_size, _, _ = get_symbol_rules(symbol)
         slp = round_price(sl_price, tick_size)
         tpp = round_price(tp_price, tick_size)
 
-        # crear stop market (reduceOnly)
         try:
-            # STOP_MARKET order: usa 'stopPrice' y reduceOnly
-            client.futures_create_order(
-                symbol=symbol,
-                side='SELL' if side=='LONG' else 'BUY',
-                type='STOP_MARKET',
-                stopPrice=slp,
-                closePosition=False,
-                reduceOnly=True,
-                quantity=qty
-            )
-            print(f"SL (reduceOnly STOP_MARKET) colocado en {slp}")
+            client.futures_create_order(symbol=symbol, side='SELL' if side=='LONG' else 'BUY',
+                                        type='STOP_MARKET', stopPrice=slp, reduceOnly=True, quantity=qty)
+            print(f"SL colocado en {slp}")
         except Exception as e:
             print("No se pudo colocar SL:", e)
 
-        # crear take profit market (reduceOnly)
         try:
-            client.futures_create_order(
-                symbol=symbol,
-                side='SELL' if side=='LONG' else 'BUY',
-                type='TAKE_PROFIT_MARKET',
-                stopPrice=tpp,
-                closePosition=False,
-                reduceOnly=True,
-                quantity=qty
-            )
-            print(f"TP (reduceOnly TAKE_PROFIT_MARKET) colocado en {tpp}")
+            client.futures_create_order(symbol=symbol, side='SELL' if side=='LONG' else 'BUY',
+                                        type='TAKE_PROFIT_MARKET', stopPrice=tpp, reduceOnly=True, quantity=qty)
+            print(f"TP colocado en {tpp}")
         except Exception as e:
             print("No se pudo colocar TP:", e)
 
@@ -293,7 +232,6 @@ def open_position_with_tp_sl(symbol, side, sl_price, tp_price):
 # Main
 # ------------------------------
 if __name__ == "__main__":
-    # establecer apalancamiento
     try:
         client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
         print(f"Apalancamiento establecido: x{LEVERAGE} para {SYMBOL}")
