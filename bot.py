@@ -56,9 +56,13 @@ def calculate_qty_full_balance(symbol, leverage):
         print("⚠️ No hay USDT disponible.")
         return 0.0
     price = float(client.futures_symbol_ticker(symbol=symbol)['price'])
-    raw_qty = (usdt_balance * leverage) / price
-    step_size, tick_size, _, min_qty = get_symbol_rules(symbol)
+    # Dejamos un 5% de colchón para evitar margen insuficiente
+    raw_qty = (usdt_balance * 0.95 * leverage) / price
+    step_size, tick_size, min_notional, min_qty = get_symbol_rules(symbol)
     qty = max(round_step(raw_qty, step_size), min_qty)
+    if qty * price < min_notional:
+        print(f"⚠️ Qty ajustada no cumple notional mínimo ({min_notional} USDT)")
+        return 0.0
     return qty
 
 def get_futures_klines(symbol, interval='1m', limit=200):
