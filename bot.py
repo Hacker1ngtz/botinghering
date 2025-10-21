@@ -1,261 +1,213 @@
+# =======================================================
+# BOT SCALPING FUTUROS BINANCE – "Pulse Reversal Pro"
+# Estrategia reactiva con momentum, reversión y volumen
+# =======================================================
+
 import os
 import time
 import math
 import pandas as pd
+import numpy as np
 from binance.client import Client
-from binance.enums import *
+from binance.exceptions import BinanceAPIException
 
 # ==============================
-# CONFIGURACIÓN
+# CONFIGURACIÓN BASE
 # ==============================
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
-SYMBOL = os.getenv("SYMBOL", "BNBUSDT").upper()
-LEVERAGE = int(os.getenv("LEVERAGE", 10))
-SLEEP_SECONDS = float(os.getenv("SLEEP_SECONDS", 1.5))
 
-EMA_FAST = int(os.getenv("EMA_FAST", 8))
-EMA_SLOW = int(os.getenv("EMA_SLOW", 21))
-RSI_LEN = int(os.getenv("RSI_LEN", 5))
-MACD_FAST = int(os.getenv("MACD_FAST", 12))
-MACD_SLOW = int(os.getenv("MACD_SLOW", 26))
-MACD_SIGNAL = int(os.getenv("MACD_SIGNAL", 9))
-ATR_LEN = int(os.getenv("ATR_LEN", 7))
-
-ATR_MULT_SL = float(os.getenv("ATR_MULT_SL", 1.0))
-TRAILING_SL_STEP = float(os.getenv("TRAILING_SL_STEP", 0.5))  # % ATR
-USDT_USAGE_FACTOR = float(os.getenv("USDT_USAGE_FACTOR", 0.5))
+SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
+LEVERAGE = int(os.getenv("LEVERAGE", 20))
+INTERVAL = os.getenv("INTERVAL", "1m")
+LIMIT = 300
+SLEEP_SECONDS = 8
+RISK = 0.02
 
 client = Client(API_KEY, API_SECRET)
+client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
 
 # ==============================
 # FUNCIONES AUXILIARES
 # ==============================
-def round_step(quantity, step):
-    precision = max(0, int(round(-math.log10(step))))
-    qty = math.floor(quantity / step) * step
-    return round(qty, precision)
 
-def round_price(price, tick):
-    precision = max(0, int(round(-math.log10(tick))))
-    return round(price, precision)
+def get_balance_usdt():
+    balance = client.futures_account_balance()
+    usdt = [x for x in balance if x['asset'] == 'USDT']
+    return float(usdt[0]['balance'])
 
-def get_symbol_rules(symbol):
-    info = client.futures_exchange_info()
-    s_info = next((s for s in info["symbols"] if s["symbol"] == symbol), None)
-    step_size = float(next(f["stepSize"] for f in s_info["filters"] if f["filterType"] == "LOT_SIZE"))
-    tick_size = float(next(f["tickSize"] for f in s_info["filters"] if f["filterType"] == "PRICE_FILTER"))
-    min_notional = float(next(f.get("minNotional", 5.0) for f in s_info["filters"] if f["filterType"] == "MIN_NOTIONAL"))
-    min_qty = float(next(f["minQty"] for f in s_info["filters"] if f["filterType"] == "LOT_SIZE"))
-    return step_size, tick_size, min_notional, min_qty
-
-def get_futures_klines(symbol, interval="1m", limit=200):
-    klines = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
-    df = pd.DataFrame(
-        klines,
-        columns=[
-            "open_time","open","high","low","close","volume","close_time",
-            "quote_asset_volume","num_trades","taker_buy_base","taker_buy_quote","ignore"
-        ]
-    )
-    for c in ["open","high","low","close","volume"]:
-        df[c] = df[c].astype(float)
+def get_klines(symbol, interval, limit):
+    data = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
+    df = pd.DataFrame(data, columns=[
+        'time','open','high','low','close','volume','close_time','qav','trades','tbbav','tbqav','ignore'])
+    df['close'] = df['close'].astype(float)
+    df['high'] = df['high'].astype(float)
+    df['low'] = df['low'].astype(float)
+    df['volume'] = df['volume'].astype(float)
     return df
 
-# ==============================
-# INDICADORES
-# ==============================
-def calculate_indicators(df):
-    df = df.copy()
-    df["ema_fast"] = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
-    df["ema_slow"] = df["close"].ewm(span=EMA_SLOW, adjust=False).mean()
+def calc_indicators(df):
+    # EMA rápida y lenta
+    df['ema_fast'] = df['close'].ewm(span=8, adjust=False).mean()
+    df['ema_slow'] = df['close'].ewm(span=21, adjust=False).mean()
 
-    delta = df["close"].diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    roll_up = up.rolling(RSI_LEN).mean()
-    roll_down = down.rolling(RSI_LEN).mean()
-    df["rsi"] = 100 - (100 / (1 + roll_up / roll_down))
+    # RSI corto y largo
+    delta = df['close'].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    rs3 = gain.rolling(3).mean() / loss.rolling(3).mean()
+    rs14 = gain.rolling(14).mean() / loss.rolling(14).mean()
+    df['rsi3'] = 100 - (100 / (1 + rs3))
+    df['rsi14'] = 100 - (100 / (1 + rs14))
 
-    ema_fast_macd = df["close"].ewm(span=MACD_FAST, adjust=False).mean()
-    ema_slow_macd = df["close"].ewm(span=MACD_SLOW, adjust=False).mean()
-    df["macd"] = ema_fast_macd - ema_slow_macd
-    df["macd_signal"] = df["macd"].ewm(span=MACD_SIGNAL, adjust=False).mean()
+    # ADX
+    df['up_move'] = df['high'] - df['high'].shift(1)
+    df['down_move'] = df['low'].shift(1) - df['low']
+    df['plus_dm'] = np.where((df['up_move'] > df['down_move']) & (df['up_move'] > 0), df['up_move'], 0)
+    df['minus_dm'] = np.where((df['down_move'] > df['up_move']) & (df['down_move'] > 0), df['down_move'], 0)
+    tr1 = df['high'] - df['low']
+    tr2 = abs(df['high'] - df['close'].shift(1))
+    tr3 = abs(df['low'] - df['close'].shift(1))
+    df['tr'] = np.max([tr1, tr2, tr3], axis=0)
+    df['atr'] = df['tr'].rolling(14).mean()
+    df['plus_di'] = 100 * (df['plus_dm'].ewm(alpha=1/14).mean() / df['atr'])
+    df['minus_di'] = 100 * (df['minus_dm'].ewm(alpha=1/14).mean() / df['atr'])
+    df['adx'] = abs(df['plus_di'] - df['minus_di']).ewm(alpha=1/14).mean()
 
-    df["hl"] = df["high"] - df["low"]
-    df["hc"] = (df["high"] - df["close"].shift(1)).abs()
-    df["lc"] = (df["low"] - df["close"].shift(1)).abs()
-    df["tr"] = df[["hl", "hc", "lc"]].max(axis=1)
-    df["atr"] = df["tr"].rolling(ATR_LEN).mean()
+    # VWAP
+    df['typical'] = (df['high'] + df['low'] + df['close']) / 3
+    df['vwap'] = (df['typical'] * df['volume']).cumsum() / df['volume'].cumsum()
+
     return df
 
+def calculate_qty(symbol, leverage):
+    balance = get_balance_usdt()
+    price = float(client.futures_symbol_ticker(symbol=symbol)['price'])
+    qty = (balance * RISK * leverage) / price
+    return round(qty, 3)
+
 # ==============================
-# NUEVA ESTRATEGIA — Momentum Fusion Scalper
+# SEÑALES – Pulse Reversal Logic
 # ==============================
-def get_best_signal(df):
-    row = df.iloc[-1]
+
+def generate_signal(df):
+    latest = df.iloc[-1]
     prev = df.iloc[-2]
 
-    long_score = 0
-    short_score = 0
+    signal = None
+    reason = []
 
-    # Tendencia + pendiente
-    ema_fast_slope = row["ema_fast"] - prev["ema_fast"]
-    ema_slow_slope = row["ema_slow"] - prev["ema_slow"]
+    # Condición de tendencia
+    if latest['ema_fast'] > latest['ema_slow']:
+        trend = "LONG"
+    elif latest['ema_fast'] < latest['ema_slow']:
+        trend = "SHORT"
+    else:
+        trend = None
 
-    if row["ema_fast"] > row["ema_slow"] and ema_fast_slope > ema_slow_slope:
-        long_score += 2
-    elif row["ema_fast"] < row["ema_slow"] and ema_fast_slope < ema_slow_slope:
-        short_score += 2
+    # Reversión RSI y fuerza ADX
+    if latest['rsi3'] < 25 and latest['rsi14'] < 40 and latest['adx'] > 20:
+        signal = "LONG"
+        reason.append("RSI sobreventa + ADX fuerte")
+    elif latest['rsi3'] > 75 and latest['rsi14'] > 60 and latest['adx'] > 20:
+        signal = "SHORT"
+        reason.append("RSI sobrecompra + ADX fuerte")
 
-    # RSI y MACD
-    if row["rsi"] > 55 and row["macd"] > row["macd_signal"]:
-        long_score += 2
-    elif row["rsi"] < 45 and row["macd"] < row["macd_signal"]:
-        short_score += 2
+    # Confirmación con VWAP y tendencia
+    if signal == "LONG" and latest['close'] > latest['vwap'] and trend == "LONG":
+        reason.append("Confirmación VWAP y EMA")
+    elif signal == "SHORT" and latest['close'] < latest['vwap'] and trend == "SHORT":
+        reason.append("Confirmación VWAP y EMA")
+    else:
+        signal = None
+        reason.append("Sin confirmación VWAP/tendencia")
 
-    # Filtro anti-lateralidad
-    ema_distance = abs(row["ema_fast"] - row["ema_slow"]) / row["close"]
-    if ema_distance < 0.001:
-        return None
-
-    # Confirmación por vela
-    body = abs(row["close"] - row["open"])
-    candle_strength = body / (row["high"] - row["low"] + 1e-6)
-    if candle_strength > 0.6:
-        if row["close"] > row["open"]:
-            long_score += 1
-        else:
-            short_score += 1
-
-    diff = abs(long_score - short_score)
-    if diff < 2:
-        return None
-
-    if long_score > short_score:
-        return "LONG"
-    elif short_score > long_score:
-        return "SHORT"
-    return None
+    return signal, reason
 
 # ==============================
-# POSICIONES
+# GESTIÓN DE OPERACIONES
 # ==============================
-def cancel_all_open_orders(symbol):
+
+def close_all_orders(symbol):
     try:
-        orders = client.futures_get_open_orders(symbol=symbol)
-        for o in orders:
-            client.futures_cancel_order(symbol=symbol, orderId=o["orderId"])
-        if orders:
-            print(f"🧹 Canceladas {len(orders)} órdenes abiertas previas")
+        client.futures_cancel_all_open_orders(symbol=symbol)
     except Exception as e:
         print(f"⚠️ Error cancelando órdenes: {e}")
 
-def get_current_position(symbol):
-    pos = client.futures_position_information(symbol=symbol)
-    for p in pos:
-        if p["symbol"] == symbol:
-            return float(p["positionAmt"])
-    return 0.0
-
-def is_position_open(symbol):
-    return abs(get_current_position(symbol)) > 0
-
-def calculate_qty(symbol, leverage):
-    balances = client.futures_account_balance()
-    usdt_balance = next((float(b["balance"]) for b in balances if b["asset"] == "USDT"), 0.0)
-    if usdt_balance <= 0:
-        return 0.0
-    price = float(client.futures_symbol_ticker(symbol=symbol)["price"])
-    step_size, tick_size, min_notional, min_qty = get_symbol_rules(symbol)
-    raw_qty = (usdt_balance * leverage * USDT_USAGE_FACTOR) / price
-    if raw_qty * price < min_notional:
-        raw_qty = min_notional / price
-    return max(round_step(raw_qty, step_size), min_qty)
-
-def manage_trailing_stop(symbol, side, atr):
-    pos_amt = get_current_position(symbol)
-    if pos_amt == 0:
-        return
-    price = float(client.futures_symbol_ticker(symbol=symbol)["price"])
-    step_size, tick_size, _, _ = get_symbol_rules(symbol)
-    if side == "LONG":
-        new_sl = round_price(price - TRAILING_SL_STEP * atr, tick_size)
-        try:
-            client.futures_create_order(
-                symbol=symbol, side=SIDE_SELL,
-                type="STOP_MARKET", stopPrice=new_sl, closePosition=True
-            )
-        except:
-            pass
-    elif side == "SHORT":
-        new_sl = round_price(price + TRAILING_SL_STEP * atr, tick_size)
-        try:
-            client.futures_create_order(
-                symbol=symbol, side=SIDE_BUY,
-                type="STOP_MARKET", stopPrice=new_sl, closePosition=True
-            )
-        except:
-            pass
-
 def open_position(symbol, side, qty, atr):
-    if is_position_open(symbol):
-        print("⚠️ Ya hay posición abierta")
-        return None
-    cancel_all_open_orders(symbol)
-    price = float(client.futures_symbol_ticker(symbol=symbol)["price"])
-    step_size, tick_size, _, _ = get_symbol_rules(symbol)
-    sl_price = price - ATR_MULT_SL * atr if side == "LONG" else price + ATR_MULT_SL * atr
-    min_distance = tick_size * 2
+    close_all_orders(symbol)
+    mark_price = float(client.futures_mark_price(symbol=symbol)['markPrice'])
+
     if side == "LONG":
-        sl_price = max(price - ATR_MULT_SL * atr, price - min_distance)
+        stop_loss = mark_price - (atr * 1.2)
+        take_profit = mark_price + (atr * 2.5)
+        position_side = "BUY"
     else:
-        sl_price = min(price + ATR_MULT_SL * atr, price + min_distance)
-    sl_price = round_price(sl_price, tick_size)
+        stop_loss = mark_price + (atr * 1.2)
+        take_profit = mark_price - (atr * 2.5)
+        position_side = "SELL"
+
+    print(f"🚀 {side} | Qty={qty} | Entrada={mark_price}")
+    print(f"🛑 SL={stop_loss} | 🎯 TP={take_profit}")
+
     try:
         client.futures_create_order(
             symbol=symbol,
-            side=SIDE_BUY if side == "LONG" else SIDE_SELL,
-            type=FUTURE_ORDER_TYPE_MARKET,
-            quantity=qty,
+            side=position_side,
+            type="MARKET",
+            quantity=qty
         )
+
         client.futures_create_order(
             symbol=symbol,
-            side=SIDE_SELL if side == "LONG" else SIDE_BUY,
+            side="SELL" if side == "LONG" else "BUY",
             type="STOP_MARKET",
-            stopPrice=sl_price,
-            closePosition=True,
+            stopPrice=round(stop_loss, 2),
+            closePosition=True
         )
-        print(f"✅ Posición {side} abierta. SL={sl_price}, qty={qty}")
-        return side
-    except Exception as e:
-        print("⚠️ Error abriendo posición:", e)
-        return None
+
+        client.futures_create_order(
+            symbol=symbol,
+            side="SELL" if side == "LONG" else "BUY",
+            type="TAKE_PROFIT_MARKET",
+            stopPrice=round(take_profit, 2),
+            closePosition=True
+        )
+
+    except BinanceAPIException as e:
+        print(f"⚠️ Error abriendo posición: {e.message}")
 
 # ==============================
 # LOOP PRINCIPAL
 # ==============================
-if __name__ == "__main__":
-    client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
-    print(f"🚀 Bot Momentum Fusion Scalper activo para {SYMBOL} x{LEVERAGE}")
-    active_side = None
 
+def main():
+    print(f"💹 Bot iniciado en {SYMBOL} [{INTERVAL}] con apalancamiento {LEVERAGE}x")
     while True:
         try:
-            df = get_futures_klines(SYMBOL, interval="1m", limit=50)
-            df = calculate_indicators(df)
-            atr = df["atr"].iloc[-1]
+            df = get_klines(SYMBOL, INTERVAL, LIMIT)
+            df = calc_indicators(df)
+            signal, reason = generate_signal(df)
+            atr = df['atr'].iloc[-1]
 
-            if is_position_open(SYMBOL) and active_side:
-                manage_trailing_stop(SYMBOL, active_side, atr)
+            print(f"\n🕐 {pd.Timestamp.now()} | Señal: {signal} | {' | '.join(reason)}")
+
+            positions = client.futures_position_information(symbol=SYMBOL)
+            pos = [p for p in positions if float(p['positionAmt']) != 0]
+
+            if len(pos) > 0:
+                print("📊 Posición activa, esperando cierre...")
+            elif signal:
+                qty = calculate_qty(SYMBOL, LEVERAGE)
+                open_position(SYMBOL, signal, qty, atr)
             else:
-                signal = get_best_signal(df)
-                if signal:
-                    qty = calculate_qty(SYMBOL, LEVERAGE)
-                    active_side = open_position(SYMBOL, signal, qty, atr)
-                else:
-                    print("⏸️ Sin señal clara, esperando oportunidad...")
+                print("⏸ Sin confirmación. Esperando...")
 
         except Exception as e:
-            print(f"⚠️ Error en loop: {e}")
+            print(f"⚠️ Error en loop principal: {e}")
+
         time.sleep(SLEEP_SECONDS)
+
+
+if __name__ == "__main__":
+    main()
