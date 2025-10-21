@@ -36,4 +36,16 @@ def get_best_signal(df):
         if row['close'] > row['open']:
             long_score += 1
         else:
-            short
+            short_score += 1
+
+    # ====== 5. Decisión final ======
+    diff = abs(long_score - short_score)
+    if diff < 2:
+        return None  # Señal débil, no operar
+
+    if long_score > short_score:
+        return 'LONG'
+    elif short_score > long_score:
+        return 'SHORT'
+    else:
+        return None
