@@ -1,105 +1,6 @@
 """
 Bot de trading (Binance Futures) con websocket de kline para reaccionar en tiempo real.
-- Reacciona ante la vela en formación (kline "is closed" = False) para entrar más rápido.
-- Cachea reglas del símbolo.
-- Usa un cooldown/debounce para evitar entradas repetidas en la misma señal.
-- Recomiendo probar primero en TESTNET (set TESTNET=1 en env) antes de ir LIVE.
-"""
-
-import os
-import time
-import math
-import threading
-import pandas as pd
-from datetime import datetime, timedelta, timezone
-from binance.client import Client
-from binance.enums import *
-from binance import ThreadedWebsocketManager
-
-# ==============================
-# CONFIGURACIÓN DESDE VARIABLES DE ENTORNO
-# ==============================
-API_KEY = os.getenv("BINANCE_API_KEY")
-API_SECRET = os.getenv("BINANCE_API_SECRET")
-SYMBOL = os.getenv("SYMBOL", "BNBUSDT").upper()
-LEVERAGE = int(os.getenv("LEVERAGE", 10))
-SLEEP_SECONDS = int(os.getenv("SLEEP_SECONDS", 1))   # loop de respaldo (no usado para decidir señal)
-TESTNET = os.getenv("TESTNET", "0") == "1"           # si es "1", usar TESTNET
-COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", 20))    # evitar reentrar inmediatamente
-MIN_INTERVAL_BETWEEN_SIGNALS = COOLDOWN_SEC
-
-# Indicadores
-ATR_LEN = int(os.getenv("ATR_LEN", 14))
-ATR_MULT = float(os.getenv("ATR_MULT", 1.0))
-SHORT_EMA = int(os.getenv("SHORT_EMA", 21))
-LONG_EMA = int(os.getenv("LONG_EMA", 65))
-RSI_FAST = int(os.getenv("RSI_FAST", 25))
-RSI_SLOW = int(os.getenv("RSI_SLOW", 100))
-
-# ==============================
-# VALIDACIONES INICIALES
-# ==============================
-if not API_KEY or not API_SECRET:
-    raise SystemExit("Faltan BINANCE_API_KEY / BINANCE_API_SECRET en variables de entorno.")
-
-# ==============================
-# CLIENTE BINANCE (FUTURES) - TESTNET OPCIONAL
-# ==============================
-if TESTNET:
-    client = Client(API_KEY, API_SECRET, testnet=True)
-else:
-    client = Client(API_KEY, API_SECRET)
-
-# ==============================
-# GLOBALS / CACHE
-# ==============================
-klines_df = None                 # DataFrame con velas recientes
-klines_lock = threading.Lock()   # bloqueo para acceso seguro al df
-last_signal_time = None          # timestamp de última ejecución de señal
-last_signal_side = None          # lado de última señal para evitar duplicados
-step_size = None
-tick_size = None
-min_notional = None
-min_qty = None
-
-# ==============================
-# UTILIDADES NUMÉRICAS
-# ==============================
-def round_step(quantity, step):
-    """Round down to step with correct precision."""
-    precision = max(0, int(round(-math.log10(step))))
-    qty = math.floor(quantity / step) * step
-    return round(qty, precision)
-
-def round_price(price, tick):
-    precision = max(0, int(round(-math.log10(tick))))
-    return round(price, precision)
-
-# ==============================
-# REGLAS DEL SIMBOLO (CACHE)
-# ==============================
-def load_symbol_rules(symbol):
-    global step_size, tick_size, min_notional, min_qty
-    info = client.futures_exchange_info()
-    s_info = next((s for s in info['symbols'] if s['symbol'] == symbol), None)
-    if not s_info:
-        raise SystemExit(f"Símbolo {symbol} no encontrado en exchange info.")
-    step_size = float(next(f['stepSize'] for f in s_info['filters'] if f['filterType'] == 'LOT_SIZE'))
-    tick_size = float(next(f['tickSize'] for f in s_info['filters'] if f['filterType'] == 'PRICE_FILTER'))
-    min_notional = float(next((f.get('minNotional', 5.0) for f in s_info['filters'] if f['filterType'] == 'MIN_NOTIONAL'), 5.0))
-    min_qty = float(next(f['minQty'] for f in s_info['filters'] if f['filterType'] == 'LOT_SIZE'))
-    print(f"Cached rules: step_size={step_size}, tick_size={tick_size}, min_qty={min_qty}, min_notional={min_notional}")
-
-# ==============================
-# OBTENER CANTIDAD SEGURA
-# ==============================
-def get_usdt_balance():
-    balances = client.futures_account_balance()
-    usdt_balance = next((float(b['balance']) for b in balances if b['asset'] == 'USDT'), 0.0)
-    return usdt_balance
-
-def calculate_qty_from_balance(symbol, leverage, usdt_balance, step_size, min_qty):
-    price = float(client.futures_symbol_ticker(symbol=symbol)['price'])
+- Reacc
     raw_qty = (usdt_balance * leverage) / price
     qty = max(round_step(raw_qty, step_size), min_qty)
     return qty
@@ -352,4 +253,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
