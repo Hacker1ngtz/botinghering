@@ -11,7 +11,7 @@ import time
 import math
 import threading
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from binance.client import Client
 from binance.enums import *
 from binance import ThreadedWebsocketManager
@@ -45,7 +45,10 @@ if not API_KEY or not API_SECRET:
 # ==============================
 # CLIENTE BINANCE (FUTURES) - TESTNET OPCIONAL
 # ==============================
-client = Client(API_KEY, API_SECRET, testnet=TESTNET)
+if TESTNET:
+    client = Client(API_KEY, API_SECRET, testnet=True)
+else:
+    client = Client(API_KEY, API_SECRET)
 
 # ==============================
 # GLOBALS / CACHE
@@ -63,6 +66,7 @@ min_qty = None
 # UTILIDADES NUMÉRICAS
 # ==============================
 def round_step(quantity, step):
+    """Round down to step with correct precision."""
     precision = max(0, int(round(-math.log10(step))))
     qty = math.floor(quantity / step) * step
     return round(qty, precision)
@@ -87,7 +91,7 @@ def load_symbol_rules(symbol):
     print(f"Cached rules: step_size={step_size}, tick_size={tick_size}, min_qty={min_qty}, min_notional={min_notional}")
 
 # ==============================
-# BALANCE Y QTY
+# OBTENER CANTIDAD SEGURA
 # ==============================
 def get_usdt_balance():
     balances = client.futures_account_balance()
@@ -101,44 +105,26 @@ def calculate_qty_from_balance(symbol, leverage, usdt_balance, step_size, min_qt
     return qty
 
 # ==============================
-# POSICIONES (SAFE)
-# ==============================
-def get_current_position_amount_safe(symbol):
-    pos_info = client.futures_position_information(symbol=symbol)
-    if not pos_info:
-        return 0.0
-    return float(pos_info[0].get("positionAmt", 0))
-
-def close_opposite_if_needed_sync(symbol, target_side):
-    amt = get_current_position_amount_safe(symbol)
-    if amt == 0:
-        return True
-    existing_side = 'LONG' if amt > 0 else 'SHORT'
-    if existing_side == target_side:
-        return True
-    qty = abs(amt)
-    side_for_close = SIDE_SELL if amt > 0 else SIDE_BUY
-    try:
-        client.futures_create_order(symbol=symbol, side=side_for_close, type='MARKET', quantity=qty, reduceOnly=True)
-        time.sleep(0.3)
-        return True
-    except Exception as e:
-        print(f"Error cerrando posición opuesta: {e}")
-        return False
-
-# ==============================
 # KLINES (Websocket callback)
 # ==============================
 def kline_to_row(k):
+    open_time = int(k['t'])
+    open_p = float(k['o'])
+    high_p = float(k['h'])
+    low_p = float(k['l'])
+    close_p = float(k['c'])
+    volume = float(k['v'])
+    close_time = int(k['T'])
+    is_closed = bool(k['x'])
     return {
-        'open_time': int(k['t']),
-        'open': float(k['o']),
-        'high': float(k['h']),
-        'low': float(k['l']),
-        'close': float(k['c']),
-        'volume': float(k['v']),
-        'close_time': int(k['T']),
-        'is_closed': bool(k['x'])
+        'open_time': open_time,
+        'open': open_p,
+        'high': high_p,
+        'low': low_p,
+        'close': close_p,
+        'volume': volume,
+        'close_time': close_time,
+        'is_closed': is_closed
     }
 
 def kline_callback(msg):
@@ -148,17 +134,16 @@ def kline_callback(msg):
         row = kline_to_row(k)
         with klines_lock:
             if klines_df is None:
-                klines_df = get_futures_klines(SYMBOL, interval='1m', limit=200)
+                df_hist = get_futures_klines(SYMBOL, interval='1m', limit=200)
+                klines_df = df_hist
             last_open_time = klines_df.iloc[-1]['open_time']
             if row['open_time'] == last_open_time:
-                # actualizar vela en formación
                 klines_df.at[klines_df.index[-1], 'open'] = row['open']
                 klines_df.at[klines_df.index[-1], 'high'] = max(klines_df.iloc[-1]['high'], row['high'])
                 klines_df.at[klines_df.index[-1], 'low'] = min(klines_df.iloc[-1]['low'], row['low'])
                 klines_df.at[klines_df.index[-1], 'close'] = row['close']
                 klines_df.at[klines_df.index[-1], 'volume'] = row['volume']
             else:
-                # nueva vela
                 new_row = {
                     'open_time': row['open_time'],
                     'open': row['open'],
@@ -175,18 +160,16 @@ def kline_callback(msg):
                 }
                 klines_df = pd.concat([klines_df.iloc[1:].reset_index(drop=True), pd.DataFrame([new_row])], ignore_index=True)
             df_copy = klines_df.copy()
-
-        # calcular indicadores y señales
         df_ind = calculate_indicators(df_copy)
         signal, sl, tp = check_signals(df_ind)
 
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)  # <-- actualizado
         if signal:
             if last_signal_time and (now - last_signal_time).total_seconds() < MIN_INTERVAL_BETWEEN_SIGNALS:
                 if last_signal_side == signal:
-                    print(f"[{now.isoformat()}] Señal {signal} detectada pero en cooldown. Ignorando.")
+                    print(f"[{now.isoformat()}] Señal {signal} detectada pero en cooldown ({MIN_INTERVAL_BETWEEN_SIGNALS}s). Ignorando.")
                 else:
-                    print(f"[{now.isoformat()}] Señal contraria dentro de cooldown: {signal}. Permitida.")
+                    print(f"[{now.isoformat()}] Señal contraria detectada dentro de cooldown: {signal}. Permitida.")
                     execute_signal_if_safe(signal, sl, tp)
                     last_signal_time = now
                     last_signal_side = signal
@@ -200,7 +183,7 @@ def kline_callback(msg):
         print(f"⚠️ Error en kline_callback: {e}")
 
 # ==============================
-# INDICADORES Y SEÑALES
+# FUNCIONES DE INDICADORES Y SEÑALES
 # ==============================
 def get_futures_klines(symbol, interval='1m', limit=200):
     klines = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
@@ -255,23 +238,51 @@ def check_signals(df):
 # ==============================
 # EJECUCIÓN DE ORDENES (SAFE)
 # ==============================
+def get_current_position_amount(symbol):
+    pos = client.futures_position_information(symbol=symbol)
+    for p in pos:
+        if p['symbol'] == symbol:
+            return float(p['positionAmt'])
+    return 0.0
+
+def close_opposite_if_needed_sync(symbol, target_side):
+    amt = get_current_position_amount(symbol)
+    if amt == 0:
+        return True
+    existing_side = 'LONG' if amt > 0 else 'SHORT'
+    if existing_side == target_side:
+        return True
+    qty = abs(amt)
+    side_for_close = SIDE_SELL if amt > 0 else SIDE_BUY
+    try:
+        client.futures_create_order(symbol=symbol, side=side_for_close, type='MARKET', quantity=qty, reduceOnly=True)
+        time.sleep(0.3)
+        return True
+    except Exception as e:
+        print(f"Error cerrando posición opuesta: {e}")
+        return False
+
 def execute_signal_if_safe(side, sl_price, tp_price):
     try:
         ok = close_opposite_if_needed_sync(SYMBOL, side)
         if not ok:
             print("No se pudo cerrar posición opuesta. Abortando ejecución de señal.")
             return None
+
         usdt_balance = get_usdt_balance()
         if usdt_balance <= 0:
             print("⚠️ No hay saldo USDT suficiente.")
             return None
+
         qty = calculate_qty_from_balance(SYMBOL, LEVERAGE, usdt_balance, step_size, min_qty)
         if qty <= 0:
             print("⚠️ Qty calculada inválida (<=0).")
             return None
+
         side_enum = SIDE_BUY if side == 'LONG' else SIDE_SELL
         order = client.futures_create_order(symbol=SYMBOL, side=side_enum, type=FUTURE_ORDER_TYPE_MARKET, quantity=qty)
         print(f"Order placed: side={side}, qty={qty}, orderId={order.get('orderId')}")
+
         slp = round_price(sl_price, tick_size)
         tpp = round_price(tp_price, tick_size)
         try:
@@ -294,13 +305,14 @@ def execute_signal_if_safe(side, sl_price, tp_price):
                                         quantity=qty)
         except Exception as e:
             print(f"No se pudo colocar TP: {e}")
+
         return order
     except Exception as e:
         print(f"⚠️ Error ejecutando señal: {e}")
         return None
 
 # ==============================
-# WEBSOCKET
+# WEBSOCKET Y MAIN
 # ==============================
 def start_kline_ws(symbol, interval='1m'):
     twm = ThreadedWebsocketManager(api_key=API_KEY, api_secret=API_SECRET)
@@ -309,25 +321,29 @@ def start_kline_ws(symbol, interval='1m'):
     twm.start_kline_socket(callback=kline_callback, symbol=symbol, interval=interval)
     return twm
 
-# ==============================
-# MAIN
-# ==============================
 def main():
     load_symbol_rules(SYMBOL)
+
     try:
         client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
         print(f"Apalancamiento seteado a x{LEVERAGE} para {SYMBOL}")
     except Exception as e:
         print(f"Warning: no se pudo setear apalancamiento: {e}")
+
     global klines_df
     klines_df = get_futures_klines(SYMBOL, interval='1m', limit=200)
+
     twm = start_kline_ws(SYMBOL, interval='1m')
+
     print(f"🚀 Bot ON — {SYMBOL} — Testnet={TESTNET} — Cooldown={MIN_INTERVAL_BETWEEN_SIGNALS}s")
     try:
         while True:
             time.sleep(SLEEP_SECONDS)
-            now = datetime.utcnow()
-            dt = (now - last_signal_time).total_seconds() if last_signal_time else None
+            now = datetime.now(timezone.utc)  # <-- actualizado
+            if last_signal_time:
+                dt = (now - last_signal_time).total_seconds()
+            else:
+                dt = None
             print(f"[{now.isoformat()}] Heartbeat. LastSignal={last_signal_side} dt={dt}")
     except KeyboardInterrupt:
         print("Deteniendo bot y websocket...")
