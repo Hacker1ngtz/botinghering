@@ -1,130 +1,160 @@
-import os
 import time
-from binance.client import Client
+import pandas as pd
 import numpy as np
+from binance.client import Client
+from binance.enums import *
+from binance.exceptions import BinanceAPIException
 
-# =========================================
+# =========================
 # CONFIGURACIÓN
-# =========================================
-API_KEY = os.getenv("BINANCE_API_KEY")
-API_SECRET = os.getenv("BINANCE_API_SECRET")
-SYMBOL = os.getenv("SYMBOL", "AIAUSDT")
-LEVERAGE = int(os.getenv("LEVERAGE", 10))
-SLEEP_SECONDS = int(os.getenv("SLEEP_SECONDS", 60))
-
+# =========================
+API_KEY = "TU_API_KEY"
+API_SECRET = "TU_API_SECRET"
+SIMBOLO = "BTCUSDT"
+INTERVALO = "1m"
+CANTIDAD = 0.001
+APALANCAMIENTO = 10
+SLEEP_SECONDS = 60  # segundos entre análisis
 client = Client(API_KEY, API_SECRET)
-client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
 
-# =========================================
-# PARÁMETROS DE OPERACIÓN
-# =========================================
-AMOUNT = 1                # USD por operación
-STOP_LOSS_PCT = 0.35      # 35%
-TAKE_PROFIT_PCT = 0.60    # 60%
+# =========================
+# FUNCIONES TÉCNICAS
+# =========================
 
-print(f"🚀 Bot iniciado en {SYMBOL} con apalancamiento {LEVERAGE}x")
+def obtener_datos():
+    """Descarga las últimas velas de Binance Futures"""
+    klines = client.futures_klines(symbol=SIMBOLO, interval=INTERVALO, limit=200)
+    df = pd.DataFrame(klines, columns=[
+        "timestamp", "open", "high", "low", "close", "volume",
+        "close_time", "quote_asset_volume", "number_of_trades",
+        "taker_buy_base_asset_volume", "taker_buy_quote_asset_volume", "ignore"
+    ])
+    df["open"] = df["open"].astype(float)
+    df["high"] = df["high"].astype(float)
+    df["low"] = df["low"].astype(float)
+    df["close"] = df["close"].astype(float)
+    return df
 
-# =========================================
-# FUNCIONES AUXILIARES
-# =========================================
-def get_klines(symbol, interval="1m", limit=50):
-    data = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
-    closes = np.array([float(k[4]) for k in data])
-    return closes
 
-def ema(values, period):
-    return np.convolve(values, np.ones(period)/period, mode='valid')
+def ema(data, period):
+    return data.ewm(span=period, adjust=False).mean()
 
-def rsi(values, period=14):
-    deltas = np.diff(values)
-    seed = deltas[:period]
-    up = seed[seed >= 0].sum() / period
-    down = -seed[seed < 0].sum() / period
-    rs = up / down if down != 0 else 0
-    rsi_series = np.zeros_like(values)
-    rsi_series[:period] = 100. - 100. / (1. + rs)
+def sma(data, period):
+    return data.rolling(period).mean()
 
-    for i in range(period, len(values)):
-        delta = deltas[i - 1]
-        upval = max(delta, 0)
-        downval = -min(delta, 0)
-        up = (up * (period - 1) + upval) / period
-        down = (down * (period - 1) + downval) / period
-        rs = up / down if down != 0 else 0
-        rsi_series[i] = 100. - 100. / (1. + rs)
-    return rsi_series
+def atr(df, length=10):
+    high_low = df["high"] - df["low"]
+    high_close = abs(df["high"] - df["close"].shift())
+    low_close = abs(df["low"] - df["close"].shift())
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    true_range = ranges.max(axis=1)
+    return true_range.rolling(length).mean()
 
-def get_open_position(symbol):
-    positions = client.futures_position_information()
-    for pos in positions:
-        if pos["symbol"] == symbol and float(pos["positionAmt"]) != 0:
-            return pos
-    return None
+def supertrend(df, length=10, multiplier=4.0):
+    atr_val = atr(df, length)
+    hl2 = (df["high"] + df["low"]) / 2
+    upper_band = hl2 + (multiplier * atr_val)
+    lower_band = hl2 - (multiplier * atr_val)
+    final_upper_band = upper_band.copy()
+    final_lower_band = lower_band.copy()
 
-# =========================================
+    direction = [True] * len(df)
+    for i in range(1, len(df)):
+        if df["close"][i] > final_upper_band[i - 1]:
+            direction[i] = True
+        elif df["close"][i] < final_lower_band[i - 1]:
+            direction[i] = False
+        else:
+            direction[i] = direction[i - 1]
+            if direction[i] and final_lower_band[i] < final_lower_band[i - 1]:
+                final_lower_band[i] = final_lower_band[i - 1]
+            if not direction[i] and final_upper_band[i] > final_upper_band[i - 1]:
+                final_upper_band[i] = final_upper_band[i - 1]
+    supertrend = np.where(direction, final_lower_band, final_upper_band)
+    return supertrend, direction
+
+
+def obtener_posicion_actual():
+    posiciones = client.futures_position_information(symbol=SIMBOLO)
+    for p in posiciones:
+        if float(p["positionAmt"]) != 0:
+            return float(p["positionAmt"])
+    return 0
+
+
+def ejecutar_orden(direccion):
+    try:
+        if direccion == "BUY":
+            print("🚀 Ejecutando orden de COMPRA...")
+            client.futures_create_order(
+                symbol=SIMBOLO,
+                side=SIDE_BUY,
+                type=ORDER_TYPE_MARKET,
+                quantity=CANTIDAD
+            )
+        elif direccion == "SELL":
+            print("💣 Ejecutando orden de VENTA...")
+            client.futures_create_order(
+                symbol=SIMBOLO,
+                side=SIDE_SELL,
+                type=ORDER_TYPE_MARKET,
+                quantity=CANTIDAD
+            )
+        print("✅ Orden ejecutada correctamente.")
+    except BinanceAPIException as e:
+        print(f"❌ Error al ejecutar orden: {e.message}")
+
+
+# =========================
 # LOOP PRINCIPAL
-# =========================================
+# =========================
+print("🤖 Iniciando bot EMA+SuperTrend+NovaWave...")
+
 while True:
     try:
-        # Verifica si hay operación abierta
-        position = get_open_position(SYMBOL)
-        if position:
-            print("⏸ Operación abierta, esperando que se cierre...")
-            time.sleep(SLEEP_SECONDS)
-            continue
+        df = obtener_datos()
+        close = df["close"]
 
-        closes = get_klines(SYMBOL)
-        ema_fast = ema(closes, 9)
-        ema_slow = ema(closes, 21)
-        rsi_values = rsi(closes)
+        # --- EMAs ---
+        ema9 = ema(close, 9)
+        ema21 = ema(close, 21)
+        ema50 = ema(close, 50)
+        ema100 = ema(close, 100)
+        ema200 = ema(close, 200)
 
-        ema_fast_val = ema_fast[-1]
-        ema_slow_val = ema_slow[-1]
-        rsi_now = rsi_values[-1]
+        # --- Supertrend ---
+        st, direction = supertrend(df, 10, 4.0)
 
-        buy_signal = ema_fast_val > ema_slow_val and rsi_now < 30
-        sell_signal = ema_fast_val < ema_slow_val and rsi_now > 70
+        # --- NovaWave ---
+        nw_fast = ema(close, 9)
+        nw_slow = ema(close, 21)
+        nw_signal = sma(close, 10)
+        nw_bull = nw_fast > nw_slow
 
-        ticker = client.futures_symbol_ticker(symbol=SYMBOL)
-        price = float(ticker["price"])
-        quantity = round((AMOUNT * LEVERAGE) / price, 3)
+        # --- Señales ---
+        buy_signal = (nw_fast.iloc[-2] < nw_slow.iloc[-2]) and (nw_fast.iloc[-1] > nw_slow.iloc[-1])
+        sell_signal = (nw_fast.iloc[-2] > nw_slow.iloc[-2]) and (nw_fast.iloc[-1] < nw_slow.iloc[-1])
 
-        if buy_signal:
-            print(f"🟢 Señal de COMPRA detectada a {price}")
-            client.futures_create_order(symbol=SYMBOL, side="BUY", type="MARKET", quantity=quantity)
+        print("📊 Analizando mercado...")
+        print(f"EMA9: {ema9.iloc[-1]:.2f}, EMA21: {ema21.iloc[-1]:.2f}, ST: {st[-1]:.2f}, NovaBull: {nw_bull.iloc[-1]}")
+        print(f"Signal: BUY={buy_signal}, SELL={sell_signal}")
 
-            tp = round(price * (1 + TAKE_PROFIT_PCT), 4)
-            sl = round(price * (1 - STOP_LOSS_PCT), 4)
+        posicion = obtener_posicion_actual()
 
-            client.futures_create_order(
-                symbol=SYMBOL, side="SELL", type="TAKE_PROFIT_MARKET",
-                stopPrice=tp, closePosition=True
-            )
-            client.futures_create_order(
-                symbol=SYMBOL, side="SELL", type="STOP_MARKET",
-                stopPrice=sl, closePosition=True
-            )
-            print(f"📈 TP en {tp} | 🛑 SL en {sl}")
+        if posicion == 0:
+            if buy_signal:
+                ejecutar_orden("BUY")
+            elif sell_signal:
+                ejecutar_orden("SELL")
+            else:
+                print("⏸️ Sin señal clara.")
+        else:
+            print("⚙️ Ya hay una posición abierta, esperando cierre manual o TP/SL...")
 
-        elif sell_signal:
-            print(f"🔴 Señal de VENTA detectada a {price}")
-            client.futures_create_order(symbol=SYMBOL, side="SELL", type="MARKET", quantity=quantity)
-
-            tp = round(price * (1 - TAKE_PROFIT_PCT), 4)
-            sl = round(price * (1 + STOP_LOSS_PCT), 4)
-
-            client.futures_create_order(
-                symbol=SYMBOL, side="BUY", type="TAKE_PROFIT_MARKET",
-                stopPrice=tp, closePosition=True
-            )
-            client.futures_create_order(
-                symbol=SYMBOL, side="BUY", type="STOP_MARKET",
-                stopPrice=sl, closePosition=True
-            )
-            print(f"📉 TP en {tp} | 🛑 SL en {sl}")
-
+        print("⏳ Esperando próximo ciclo...\n")
         time.sleep(SLEEP_SECONDS)
 
     except Exception as e:
-        print(f"⚠️ Error: {e}")
+        print(f"❌ Error general: {e}")
         time.sleep(SLEEP_SECONDS)
+
