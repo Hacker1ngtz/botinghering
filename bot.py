@@ -11,7 +11,7 @@ EXCHANGE = "binanceusdm"  # o "bybit", "okx", etc.
 SYMBOL = "BTC/USDT"
 TIMEFRAME = "5m"
 LEVERAGE = 10
-RISK_PERCENT = 0.25  # 25% Take Profit
+RISK_PERCENT = 0.25  # 25% Stop Loss
 SLEEP_TIME = 60 * 5  # Cada 5 minutos
 
 # ============================================
@@ -24,7 +24,7 @@ exchange = getattr(ccxt, EXCHANGE)({
     "enableRateLimit": True
 })
 exchange.load_markets()
-print(f"Conectado a {EXCHANGE} con símbolo {SYMBOL}")
+print(f"[{time.strftime('%H:%M:%S')}] Conectado a {EXCHANGE} con símbolo {SYMBOL}")
 
 # ============================================
 # FUNCIONES AUXILIARES
@@ -101,17 +101,18 @@ def get_position():
 def close_position(position):
     side = "sell" if position["side"] == "long" else "buy"
     amount = abs(float(position["contracts"]))
-    print(f"Cerrando posición {position['side']} de {amount} contratos")
+    print(f"[{time.strftime('%H:%M:%S')}] Cerrando posición {position['side']} de {amount} contratos")
     exchange.create_market_order(SYMBOL, side, amount)
 
 def open_position(side, amount, price):
-    tp_price = price * (1 + RISK_PERCENT) if side == "buy" else price * (1 - RISK_PERCENT)
-    print(f"Abrir {side.upper()} - Precio: {price}, TP: {tp_price}")
+    sl_price = price * (1 - RISK_PERCENT) if side == "buy" else price * (1 + RISK_PERCENT)
+    print(f"[{time.strftime('%H:%M:%S')}] Abrir {side.upper()} - Precio: {price}, SL: {sl_price}")
     order = exchange.create_market_order(SYMBOL, side, amount)
-    exchange.create_order(SYMBOL, "take_profit_market", 
-                          "sell" if side == "buy" else "buy", 
-                          amount, 
-                          tp_price, 
+    # Colocar stop loss
+    exchange.create_order(SYMBOL, "stop_market",
+                          "sell" if side == "buy" else "buy",
+                          amount,
+                          sl_price,
                           {"reduceOnly": True})
     return order
 
@@ -134,9 +135,15 @@ while True:
                 close_position(position)
             open_position("sell", 0.001, last_price)
 
+        # Logs
         print(f"[{time.strftime('%H:%M:%S')}] Señales -> Buy: {buy_signal}, Sell: {sell_signal}")
+        if position:
+            print(f"[{time.strftime('%H:%M:%S')}] Posición actual: {position['side']} - {position['contracts']} contratos")
+        else:
+            print(f"[{time.strftime('%H:%M:%S')}] No hay posición abierta")
+
         time.sleep(SLEEP_TIME)
 
     except Exception as e:
-        print("Error:", e)
+        print(f"[{time.strftime('%H:%M:%S')}] Error:", e)
         time.sleep(60)
