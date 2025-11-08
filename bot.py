@@ -7,12 +7,12 @@ import ccxt
 
 API_KEY = "TU_API_KEY"
 API_SECRET = "TU_API_SECRET"
-EXCHANGE = "binanceusdm"  # o "bybit", "okx", etc.
+EXCHANGE = "binanceusdm"
 SYMBOL = "BTC/USDT"
 TIMEFRAME = "5m"
 LEVERAGE = 10
-RISK_PERCENT = 0.25  # 25% Stop Loss
-SLEEP_TIME = 60 * 5  # Cada 5 minutos
+RISK_PERCENT = 0.25  # 25% Take Profit
+SLEEP_TIME = 60 * 5
 
 # ============================================
 # CONEXIÓN CON EL EXCHANGE
@@ -32,6 +32,7 @@ print(f"[{time.strftime('%H:%M:%S')}] Conectado a {EXCHANGE} con símbolo {SYMBO
 
 def get_candles(symbol, timeframe, limit=100):
     candles = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    print(f"[{time.strftime('%H:%M:%S')}] Obteniendo {limit} velas de {symbol} ({timeframe})")
     return candles
 
 def ema(values, length):
@@ -42,6 +43,7 @@ def ema(values, length):
             ema_val.append(val)
         else:
             ema_val.append(val * k + ema_val[-1] * (1 - k))
+    print(f"[{time.strftime('%H:%M:%S')}] Calculada EMA({length})")
     return ema_val
 
 def rsi(values, length=14):
@@ -63,6 +65,7 @@ def rsi(values, length=14):
         avg_loss = (avg_loss * (length - 1) + losses[i]) / length
         rs = avg_gain / avg_loss if avg_loss != 0 else 0
         rsi_list.append(100 - (100 / (1 + rs)))
+    print(f"[{time.strftime('%H:%M:%S')}] Calculado RSI({length})")
     return [None] * (len(values) - len(rsi_list)) + rsi_list
 
 # ============================================
@@ -85,6 +88,8 @@ def check_signals():
     buy_signal = (last_ema_fast > last_ema_slow and last_rsi < 60)
     sell_signal = (last_ema_fast < last_ema_slow and last_rsi > 40)
 
+    print(f"[{time.strftime('%H:%M:%S')}] Señales detectadas -> Buy: {buy_signal}, Sell: {sell_signal}")
+    print(f"[{time.strftime('%H:%M:%S')}] Últimos valores -> Precio: {last_close}, EMA9: {last_ema_fast}, EMA21: {last_ema_slow}, RSI: {last_rsi}")
     return buy_signal, sell_signal, last_close
 
 # ============================================
@@ -95,7 +100,9 @@ def get_position():
     positions = exchange.fetch_positions([SYMBOL])
     for p in positions:
         if float(p["contracts"]) > 0:
+            print(f"[{time.strftime('%H:%M:%S')}] Posición actual encontrada: {p['side']} - {p['contracts']} contratos")
             return p
+    print(f"[{time.strftime('%H:%M:%S')}] No hay posición abierta")
     return None
 
 def close_position(position):
@@ -103,17 +110,19 @@ def close_position(position):
     amount = abs(float(position["contracts"]))
     print(f"[{time.strftime('%H:%M:%S')}] Cerrando posición {position['side']} de {amount} contratos")
     exchange.create_market_order(SYMBOL, side, amount)
+    print(f"[{time.strftime('%H:%M:%S')}] Posición cerrada")
 
 def open_position(side, amount, price):
-    sl_price = price * (1 - RISK_PERCENT) if side == "buy" else price * (1 + RISK_PERCENT)
-    print(f"[{time.strftime('%H:%M:%S')}] Abrir {side.upper()} - Precio: {price}, SL: {sl_price}")
+    tp_price = price * (1 + RISK_PERCENT) if side == "buy" else price * (1 - RISK_PERCENT)
+    print(f"[{time.strftime('%H:%M:%S')}] Abriendo {side.upper()} - Cantidad: {amount}, Precio: {price}, TP: {tp_price}")
     order = exchange.create_market_order(SYMBOL, side, amount)
-    # Colocar stop loss
-    exchange.create_order(SYMBOL, "stop_market",
-                          "sell" if side == "buy" else "buy",
-                          amount,
-                          sl_price,
+    print(f"[{time.strftime('%H:%M:%S')}] Orden de mercado ejecutada")
+    exchange.create_order(SYMBOL, "take_profit_market", 
+                          "sell" if side == "buy" else "buy", 
+                          amount, 
+                          tp_price, 
                           {"reduceOnly": True})
+    print(f"[{time.strftime('%H:%M:%S')}] TP configurado en {tp_price}")
     return order
 
 # ============================================
@@ -125,6 +134,7 @@ while True:
         buy_signal, sell_signal, last_price = check_signals()
         position = get_position()
 
+        # Lógica de apertura/cierre
         if buy_signal and (not position or position["side"] == "short"):
             if position:
                 close_position(position)
@@ -134,13 +144,6 @@ while True:
             if position:
                 close_position(position)
             open_position("sell", 0.001, last_price)
-
-        # Logs
-        print(f"[{time.strftime('%H:%M:%S')}] Señales -> Buy: {buy_signal}, Sell: {sell_signal}")
-        if position:
-            print(f"[{time.strftime('%H:%M:%S')}] Posición actual: {position['side']} - {position['contracts']} contratos")
-        else:
-            print(f"[{time.strftime('%H:%M:%S')}] No hay posición abierta")
 
         time.sleep(SLEEP_TIME)
 
