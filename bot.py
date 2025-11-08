@@ -1,264 +1,345 @@
-# bot.py
-import os
-import time
-import math
-import pandas as pd
-from binance.client import Client
-from binance.exceptions import BinanceAPIException
+<?php
+// scalper_binance_futures.php
+// Ejecuta trades reales en Binance Futures (USDT-M) según tu PineScript:
+// EMA(9,21) crossover + RSI(14) sobrevendido/sobrecomprado + MACD(12,26,9) crossover
+//
+// Requisitos: PHP 7.4+, ext-curl enabled
+// WARNING: Operaciones reales. Usa dryRun=true para pruebas en producción antes de arriesgar capital.
 
-# ------------------------------
-# Config desde Environment
-# ------------------------------
-API_KEY = os.getenv("BINANCE_API_KEY")
-API_SECRET = os.getenv("BINANCE_API_SECRET")
-SYMBOL = os.getenv("SYMBOL", "ETHUSDT").upper()
-LEVERAGE = int(os.getenv("LEVERAGE", 10))
-SLEEP_SECONDS = int(os.getenv("SLEEP_SECONDS", 5))  # loop rápido para reaccionar a ticks
+// ---------------- CONFIG ----------------
+const API_KEY    = 'TU_API_KEY_AQUI';
+const API_SECRET = 'TU_API_SECRET_AQUI';
+$dryRun = true;               // true = no ejecuta órdenes; false = ejecuta en fapi.binance.com (no testnet)
+$symbol  = 'BTCUSDT';         // Par
+$interval = '1m';             // Timeframe de velas
+$klinesLimit = 200;           // cuántas velas bajar para calcular indicadores
+$orderSizeUSDT = 20.0;        // USDT por operación (ajusta)
+$recvWindow = 5000;           // recvWindow para firmas
+$leverage = 20;               // leva deseada (no cambia la leva de la cuenta aquí)
+// -----------------------------------------
 
-# Indicadores
-ATR_LEN = int(os.getenv("ATR_LEN", 14))
-ATR_MULT = float(os.getenv("ATR_MULT", 1.0))
-SHORT_EMA = int(os.getenv("SHORT_EMA", 21))
-LONG_EMA = int(os.getenv("LONG_EMA", 65))
-RSI_FAST = int(os.getenv("RSI_FAST", 25))
-RSI_SLOW = int(os.getenv("RSI_SLOW", 100))
+$baseApi = $dryRun ? 'https://fapi.binance.com' : 'https://fapi.binance.com'; // same host; dryRun toggles execution in code
 
-# ------------------------------
-# Cliente Binance Futures (real)
-# ------------------------------
-client = Client(API_KEY, API_SECRET)
+// ---------- Helpers Binance signed request ----------
+function hmacSha256($data, $secret) {
+    return hash_hmac('sha256', $data, $secret);
+}
+function httpRequest($method, $endpoint, $params = [], $signed = false) {
+    global $baseApi;
+    $url = $baseApi . $endpoint;
+    $headers = ['X-MBX-APIKEY: ' . API_KEY];
+    if ($signed) {
+        $ts = round(microtime(true) * 1000);
+        $params['timestamp'] = $ts;
+        if (!isset($params['recvWindow'])) $params['recvWindow'] = 5000;
+        $qs = http_build_query($params, '', '&', PHP_QUERY_RFC1738);
+        $sig = hmacSha256($qs, API_SECRET);
+        $qs .= '&signature=' . $sig;
+        if ($method === 'GET') $url .= '?' . $qs;
+    } else {
+        if (!empty($params) && $method === 'GET') $url .= '?' . http_build_query($params);
+    }
 
-# ------------------------------
-# Helpers
-# ------------------------------
-def get_futures_klines(symbol, interval='1m', limit=200):
-    try:
-        klines = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
-        df = pd.DataFrame(klines, columns=[
-            'open_time','open','high','low','close','volume','close_time',
-            'quote_asset_volume','num_trades','taker_buy_base','taker_buy_quote','ignore'
-        ])
-        for c in ['open','high','low','close','volume']:
-            df[c] = df[c].astype(float)
-        return df
-    except Exception as e:
-        print("Error al obtener klines:", e)
-        return None
+    $ch = curl_init();
+    curl_setopt($ch, CURLOPT_URL, $url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 20);
 
-def get_symbol_rules(symbol):
-    try:
-        info = client.futures_exchange_info()
-        for s in info.get('symbols', []):
-            if s['symbol'] == symbol:
-                step_size = tick_size = 0.0
-                min_notional = min_qty = None
-                for f in s.get('filters', []):
-                    if f.get('filterType') == 'LOT_SIZE':
-                        step_size = float(f.get('stepSize', 0.0))
-                        min_qty = float(f.get('minQty', 0.0))
-                    if f.get('filterType') == 'PRICE_FILTER':
-                        tick_size = float(f.get('tickSize', 0.0))
-                    if f.get('filterType') == 'MIN_NOTIONAL':
-                        min_notional = float(f.get('notional', f.get('minNotional', 0.0)))
-                return step_size or 0.00000001, tick_size or 0.00000001, min_notional or 5.0, min_qty or 0.0
-    except Exception as e:
-        print("Error al obtener symbol rules:", e)
-    return 0.00000001, 0.00000001, 5.0, 0.0
+    if ($signed && $method !== 'GET') {
+        // For signed POST/DELETE, send as application/x-www-form-urlencoded body with signature
+        $bodyQs = http_build_query($params, '', '&', PHP_QUERY_RFC1738);
+        $sig = hmacSha256($bodyQs, API_SECRET);
+        $bodyQs .= '&signature=' . $sig;
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $bodyQs);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, array_merge($headers, ['Content-Type: application/x-www-form-urlencoded']));
+    } elseif ($method === 'POST' && !$signed) {
+        curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($params));
+    }
 
-def round_step(quantity, step):
-    precision = max(0, int(round(-math.log10(step))))
-    qty = math.floor(quantity / step) * step
-    return round(qty, precision)
+    if ($method === 'DELETE') {
+        curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'DELETE');
+    } elseif ($method === 'PUT') {
+        curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'PUT');
+    } elseif ($method !== 'GET' && $signed) {
+        curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'POST');
+    }
 
-def round_price(price, tick):
-    precision = max(0, int(round(-math.log10(tick))))
-    return round(price, precision)
+    $res = curl_exec($ch);
+    $err = curl_error($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    if ($res === false) throw new Exception("cURL error: $err");
 
-# ------------------------------
-# Indicadores
-# ------------------------------
-def calculate_indicators(df):
-    df = df.copy()
-    df['hl'] = df['high'] - df['low']
-    df['hc'] = (df['high'] - df['close'].shift(1)).abs()
-    df['lc'] = (df['low'] - df['close'].shift(1)).abs()
-    df['tr'] = df[['hl','hc','lc']].max(axis=1)
-    df['atr'] = df['tr'].rolling(ATR_LEN).mean()
+    $json = json_decode($res, true);
+    if ($json === null) {
+        // return raw if not json
+        return ['code' => $code, 'raw' => $res];
+    }
+    return ['code' => $code, 'body' => $json];
+}
 
-    df['upper_band'] = df['close'] + df['atr'] * ATR_MULT
-    df['lower_band'] = df['close'] - df['atr'] * ATR_MULT
+// ---------- Market data ----------
+function getKlines($symbol, $interval, $limit = 200) {
+    $endpoint = '/fapi/v1/klines';
+    $params = ['symbol' => $symbol, 'interval' => $interval, 'limit' => $limit];
+    $resp = httpRequest('GET', $endpoint, $params, false);
+    if ($resp['code'] !== 200) throw new Exception("Error getKlines: " . json_encode($resp));
+    return $resp['body']; // array of arrays
+}
 
-    df['ema_short'] = df['close'].ewm(span=SHORT_EMA, adjust=False).mean()
-    df['ema_long'] = df['close'].ewm(span=LONG_EMA, adjust=False).mean()
+// ---------- Account / Balance ----------
+function getFutureBalance() {
+    $endpoint = '/fapi/v2/balance';
+    $resp = httpRequest('GET', $endpoint, [], true);
+    if ($resp['code'] !== 200) throw new Exception("Error balance: " . json_encode($resp));
+    return $resp['body']; // array of balances
+}
 
-    delta = df['close'].diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    roll_up_fast = up.rolling(RSI_FAST).mean()
-    roll_down_fast = down.rolling(RSI_FAST).mean()
-    df['rsi_fast'] = 100 - (100 / (1 + roll_up_fast / roll_down_fast))
-    roll_up_slow = up.rolling(RSI_SLOW).mean()
-    roll_down_slow = down.rolling(RSI_SLOW).mean()
-    df['rsi_slow'] = 100 - (100 / (1 + roll_up_slow / roll_down_slow))
+// ---------- Exchange Info (for filters) ----------
+function getExchangeInfo() {
+    $endpoint = '/fapi/v1/exchangeInfo';
+    $resp = httpRequest('GET', $endpoint, [], false);
+    if ($resp['code'] !== 200) throw new Exception("Error exchangeInfo: " . json_encode($resp));
+    return $resp['body'];
+}
 
-    df['rsi_long'] = df['rsi_fast'] > df['rsi_slow']
-    df['rsi_short'] = df['rsi_fast'] < df['rsi_slow']
+// ---------- Order placement ----------
+function placeMarketOrder($symbol, $side, $quantity, $reduceOnly = false) {
+    // side: 'BUY' or 'SELL'
+    $endpoint = '/fapi/v1/order';
+    $params = [
+        'symbol' => $symbol,
+        'side' => $side,
+        'type' => 'MARKET',
+        'quantity' => (string)$quantity,
+        'timestamp' => round(microtime(true) * 1000),
+        'recvWindow' => 5000
+    ];
+    if ($reduceOnly) $params['reduceOnly'] = 'true';
+    // signature will be added inside httpRequest signed branch
+    $resp = httpRequest('POST', $endpoint, $params, true);
+    return $resp;
+}
 
-    df['golden_long'] = (df['ema_short'] > df['ema_long']) & (df['ema_short'].shift(1) <= df['ema_long'].shift(1))
-    df['golden_short'] = (df['ema_short'] < df['ema_long']) & (df['ema_short'].shift(1) >= df['ema_long'].shift(1))
+// ---------- Utils: EMA, RSI, MACD ----------
+function emaArray(array $prices, int $period) {
+    $n = count($prices);
+    if ($n === 0) return [];
+    $out = array_fill(0, $n, null);
+    $k = 2 / ($period + 1);
+    // seed with SMA first
+    $sum = 0.0;
+    for ($i = 0; $i < $period && $i < $n; $i++) $sum += $prices[$i];
+    $out[$period-1] = $sum / $period;
+    for ($i = $period; $i < $n; $i++) {
+        $out[$i] = ($prices[$i] - $out[$i-1]) * $k + $out[$i-1];
+    }
+    // fill leading nulls for i < period-1 with the first computed sma
+    for ($i = 0; $i < $period-1 && $i < $n; $i++) $out[$i] = null;
+    return $out;
+}
 
-    return df
+function rsiArray(array $prices, int $period = 14) {
+    $n = count($prices);
+    $out = array_fill(0, $n, null);
+    if ($n < $period) return $out;
+    $gains = 0.0; $losses = 0.0;
+    for ($i = 1; $i <= $period; $i++) {
+        $chg = $prices[$i] - $prices[$i-1];
+        if ($chg >= 0) $gains += $chg; else $losses += abs($chg);
+    }
+    $avgGain = $gains / $period;
+    $avgLoss = $losses / $period;
+    $rs = $avgLoss == 0 ? 1000 : $avgGain / $avgLoss;
+    $out[$period] = 100 - (100 / (1 + $rs));
+    for ($i = $period+1; $i < $n; $i++) {
+        $chg = $prices[$i] - $prices[$i-1];
+        $gain = $chg > 0 ? $chg : 0;
+        $loss = $chg < 0 ? abs($chg) : 0;
+        $avgGain = ($avgGain * ($period - 1) + $gain) / $period;
+        $avgLoss = ($avgLoss * ($period - 1) + $loss) / $period;
+        $rs = $avgLoss == 0 ? 1000 : $avgGain / $avgLoss;
+        $out[$i] = 100 - (100 / (1 + $rs));
+    }
+    return $out;
+}
 
-# ------------------------------
-# Señales
-# ------------------------------
-def check_signals(df):
-    row = df.iloc[-1]
-    side = None
-    sl = None
-    tp = None
-    if row['open'] < row['lower_band'] and row['rsi_long']:
-        side = 'LONG'
-        sl = row['low'] - row['atr'] * 2
-        tp = row['high'] + row['atr'] * 5
-    elif row['open'] > row['upper_band'] and row['rsi_short']:
-        side = 'SHORT'
-        sl = row['high'] + row['atr'] * 2
-        tp = row['low'] - row['atr'] * 5
-    return side, sl, tp
+function macdArrays(array $prices, $fast = 12, $slow = 26, $signal = 9) {
+    $emaFast = emaArray($prices, $fast);
+    $emaSlow = emaArray($prices, $slow);
+    $n = count($prices);
+    $macd = array_fill(0, $n, null);
+    for ($i = 0; $i < $n; $i++) {
+        if ($emaFast[$i] !== null && $emaSlow[$i] !== null) $macd[$i] = $emaFast[$i] - $emaSlow[$i];
+        else $macd[$i] = null;
+    }
+    $signalArr = emaArray(array_map(function($v){return $v===null?0:$v;}, $macd), $signal);
+    return [$macd, $signalArr];
+}
 
-# ------------------------------
-# Posición actual
-# ------------------------------
-def get_current_position(symbol):
-    try:
-        pos = client.futures_position_information(symbol=symbol)
-        for p in pos:
-            if p['symbol'] == symbol:
-                amt = float(p['positionAmt'])
-                return amt
-    except Exception as e:
-        print("Error get_current_position:", e)
-    return 0.0
+// ---------- Round quantity to stepSize ----------
+function roundToStep($quantity, $stepSize) {
+    // stepSize like "0.001" -> round down to nearest step
+    $precision = 0;
+    if (strpos($stepSize, '1') === 0 && strpos($stepSize, '.') === false) {
+        $precision = 0;
+    } else {
+        $parts = explode('.', $stepSize);
+        $precision = isset($parts[1]) ? strlen(rtrim($parts[1], '0')) : 0;
+    }
+    // floor to step
+    $mult = 1 / floatval($stepSize);
+    $q = floor($quantity * $mult) / $mult;
+    return round($q, $precision);
+}
 
-# ------------------------------
-# Cerrar opuesta
-# ------------------------------
-def close_opposite_if_needed(symbol, target_side):
-    amt = get_current_position(symbol)
-    if amt == 0:
-        return True
-    existing_side = 'LONG' if amt > 0 else 'SHORT'
-    if existing_side == target_side:
-        return True
-    qty = abs(amt)
-    try:
-        side_for_close = 'SELL' if amt > 0 else 'BUY'
-        client.futures_create_order(symbol=symbol, side=side_for_close, type='MARKET', quantity=qty, reduceOnly=True)
-        print(f"Cerrada posición opuesta ({existing_side}) qty={qty}")
-        time.sleep(1)
-        return True
-    except Exception as e:
-        print("Error cerrando opuesta:", e)
-        return False
+// ---------- Main logic ----------
+try {
+    echo "[" . date('Y-m-d H:i:s') . "] Descargando velas...\n";
+    $klines = getKlines($symbol, $interval, $klinesLimit);
 
-# ------------------------------
-# Calcular cantidad
-# ------------------------------
-def calculate_qty_full_balance(symbol, leverage):
-    try:
-        balances = client.futures_account_balance()
-        usdt_balance = 0.0
-        for b in balances:
-            if b['asset'] == 'USDT':
-                usdt_balance = float(b.get('balance', 0.0))
-                break
-        if usdt_balance <= 0:
-            print("Balance USDT vacío.")
-            return 0.0
+    $close = []; $open = []; $high = []; $low = []; $vol = [];
+    foreach ($klines as $k) {
+        // k: [ openTime, open, high, low, close, volume, ... ]
+        $open[]  = floatval($k[1]);
+        $high[]  = floatval($k[2]);
+        $low[]   = floatval($k[3]);
+        $close[] = floatval($k[4]);
+        $vol[]   = floatval($k[5]);
+    }
 
-        price = float(client.futures_symbol_ticker(symbol=symbol)['price'])
-        raw_notional = usdt_balance * leverage
-        raw_qty = raw_notional / price
-        step_size, tick_size, min_notional, min_qty = get_symbol_rules(symbol)
-        qty = round_step(raw_qty, step_size)
-        return qty
-    except Exception as e:
-        print("Error calculate_qty_full_balance:", e)
-        return 0.0
+    // Calculate indicators
+    $emaFastArr = emaArray($close, 9);
+    $emaSlowArr = emaArray($close, 21);
+    $rsiArr = rsiArray($close, 14);
+    [$macdArr, $signalArr] = macdArrays($close, 12, 26, 9);
 
-# ------------------------------
-# Abrir posición
-# ------------------------------
-def open_position_with_tp_sl(symbol, side, sl_price, tp_price):
-    ok = close_opposite_if_needed(symbol, side)
-    if not ok:
-        print("No se cerró posición opuesta, abortando apertura.")
-        return None
+    $last = count($close) - 1;
+    if ($last < 2) throw new Exception("Pocas velas para calcular indicadores.");
 
-    qty = calculate_qty_full_balance(symbol, LEVERAGE)
-    if qty <= 0:
-        print("Qty inválida, abortando.")
-        return None
+    // Crossovers detection using last and prev
+    $emaFast = $emaFastArr[$last];
+    $emaSlow = $emaSlowArr[$last];
+    $emaFastPrev = $emaFastArr[$last-1];
+    $emaSlowPrev = $emaSlowArr[$last-1];
 
-    try:
-        order = client.futures_create_order(symbol=symbol, side='BUY' if side=='LONG' else 'SELL', type='MARKET', quantity=qty)
-        print(f"Abrida posición {side} qty={qty} orderId={order.get('orderId')}")
+    $macd = $macdArr[$last]; $macdPrev = $macdArr[$last-1];
+    $signal = $signalArr[$last]; $signalPrev = $signalArr[$last-1];
 
-        step_size, tick_size, _, _ = get_symbol_rules(symbol)
-        slp = round_price(sl_price, tick_size)
-        tpp = round_price(tp_price, tick_size)
+    $rsi = $rsiArr[$last];
 
-        try:
-            client.futures_create_order(symbol=symbol, side='SELL' if side=='LONG' else 'BUY',
-                                        type='STOP_MARKET', stopPrice=slp, reduceOnly=True, quantity=qty)
-            print(f"SL colocado en {slp}")
-        except Exception as e:
-            print("No se pudo colocar SL:", e)
+    $emaCrossover = ($emaFast !== null && $emaSlow !== null && $emaFastPrev !== null && $emaSlowPrev !== null)
+        ? ($emaFast > $emaSlow && $emaFastPrev <= $emaSlowPrev) : false;
+    $emaCrossunder = ($emaFast !== null && $emaSlow !== null && $emaFastPrev !== null && $emaSlowPrev !== null)
+        ? ($emaFast < $emaSlow && $emaFastPrev >= $emaSlowPrev) : false;
 
-        try:
-            client.futures_create_order(symbol=symbol, side='SELL' if side=='LONG' else 'BUY',
-                                        type='TAKE_PROFIT_MARKET', stopPrice=tpp, reduceOnly=True, quantity=qty)
-            print(f"TP colocado en {tpp}")
-        except Exception as e:
-            print("No se pudo colocar TP:", e)
+    $macdCrossover = ($macd !== null && $signal !== null && $macdPrev !== null && $signalPrev !== null)
+        ? ($macd > $signal && $macdPrev <= $signalPrev) : false;
+    $macdCrossunder = ($macd !== null && $signal !== null && $macdPrev !== null && $signalPrev !== null)
+        ? ($macd < $signal && $macdPrev >= $signalPrev) : false;
 
-        return order
-    except Exception as e:
-        print("Error abriendo posición market:", e)
-        return None
+    $rsiOversold = ($rsi !== null) ? ($rsi < 30) : false;
+    $rsiOverbought = ($rsi !== null) ? ($rsi > 70) : false;
 
-# ------------------------------
-# Main
-# ------------------------------
-if __name__ == "__main__":
-    try:
-        client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
-        print(f"Apalancamiento establecido: x{LEVERAGE} para {SYMBOL}")
-    except Exception as e:
-        print("Warning: no se pudo establecer apalancamiento:", e)
+    $buySignal = ($emaCrossover && $rsiOversold && $macdCrossover);
+    $sellSignal = ($emaCrossunder && $rsiOverbought && $macdCrossunder);
 
-    print("Bot iniciado — MERCADO REAL (Futures). Símbolo:", SYMBOL)
+    echo "Última vela: close={$close[$last]}, RSI={$rsi}\n";
+    echo "EMA crossover: ".($emaCrossover?'YES':'no')."  EMA crossunder: ".($emaCrossunder?'YES':'no')."\n";
+    echo "MACD cross: ".($macdCrossover?'up':($macdCrossunder?'down':'none'))."\n";
+    echo "Señal BUY: ".($buySignal?'YES':'no')."  Señal SELL: ".($sellSignal?'YES':'no')."\n";
 
-    while True:
-        df = get_futures_klines(SYMBOL, interval='1m', limit=200)
-        if df is None:
-            print("No se obtuvieron velas. Reintentando en", SLEEP_SECONDS, "s")
-            time.sleep(SLEEP_SECONDS)
-            continue
+    if (!$buySignal && !$sellSignal) {
+        echo "No hay señal. Fin.\n";
+        exit;
+    }
 
-        df = calculate_indicators(df)
-        signal, sl, tp = check_signals(df)
+    // Get exchangeInfo to compute stepSize & lot size
+    $exInfo = getExchangeInfo();
+    // find symbol filters
+    $symInfo = null;
+    foreach ($exInfo['symbols'] as $s) if ($s['symbol'] === $symbol) { $symInfo = $s; break; }
+    if ($symInfo === null) throw new Exception("Symbol info no encontrada en exchangeInfo");
 
-        if signal == 'LONG':
-            print("Señal LONG detectada. Intentando abrir posición con TP/SL...")
-            open_position_with_tp_sl(SYMBOL, 'LONG', sl, tp)
-        elif signal == 'SHORT':
-            print("Señal SHORT detectada. Intentando abrir posición con TP/SL...")
-            open_position_with_tp_sl(SYMBOL, 'SHORT', sl, tp)
-        else:
-            print("No hay señales en este ciclo")
+    $lotSizeFilter = null;
+    foreach ($symInfo['filters'] as $f) {
+        if ($f['filterType'] === 'LOT_SIZE') { $lotSizeFilter = $f; break; }
+    }
+    $stepSize = $lotSizeFilter['stepSize'] ?? '0.000001';
 
-        time.sleep(SLEEP_SECONDS)
+    // Get balance USDT in futures wallet
+    $balances = getFutureBalance();
+    $usdtBalance = 0.0;
+    foreach ($balances as $b) {
+        if ($b['asset'] === 'USDT') { $usdtBalance = floatval($b['balance']); break; }
+    }
+    echo "FUTURES USDT balance: {$usdtBalance}\n";
 
+    // Compute quantity from $orderSizeUSDT and current price (market)
+    $price = $close[$last];
+    $rawQty = ($orderSizeUSDT / $price);
+    $qty = roundToStep($rawQty, $stepSize);
 
+    if ($qty <= 0) throw new Exception("Quantity calculada <= 0. Ajusta orderSizeUSDT o revisa precio/stepSize.");
+
+    // Before opening new same-direction position, close opposite side (if exists)
+    // Query positions
+    $accountInfoResp = httpRequest('GET', '/fapi/v2/positionRisk', [], true);
+    if ($accountInfoResp['code'] !== 200) throw new Exception("Error fetching positions");
+    $positions = $accountInfoResp['body'];
+    $posAmt = 0.0;
+    foreach ($positions as $p) {
+        if ($p['symbol'] === $symbol) { $posAmt = floatval($p['positionAmt']); break; }
+    }
+    // posAmt > 0 => long open, posAmt < 0 => short open
+
+    // If buySignal and there's a short open, close short first (reduceOnly SELL -> BUY to close)
+    if ($buySignal && $posAmt < 0) {
+        echo "Cerrando posición short previa (reduceOnly)...\n";
+        if (!$dryRun) {
+            $respClose = placeMarketOrder($symbol, 'BUY', abs($posAmt), true);
+            echo "Close short resp: " . json_encode($respClose) . "\n";
+            sleep(1);
+        } else {
+            echo "[dryRun] Simulo cierre short qty=" . abs($posAmt) . "\n";
+        }
+    }
+
+    // If sellSignal and there's a long open, close long first
+    if ($sellSignal && $posAmt > 0) {
+        echo "Cerrando posición long previa (reduceOnly)...\n";
+        if (!$dryRun) {
+            $respClose = placeMarketOrder($symbol, 'SELL', abs($posAmt), true);
+            echo "Close long resp: " . json_encode($respClose) . "\n";
+            sleep(1);
+        } else {
+            echo "[dryRun] Simulo cierre long qty=" . abs($posAmt) . "\n";
+        }
+    }
+
+    // Place new market order in desired direction
+    if ($buySignal) {
+        echo "Ejecutando orden MARKET BUY qty={$qty}\n";
+        if (!$dryRun) {
+            $resp = placeMarketOrder($symbol, 'BUY', $qty, false);
+            echo "Order resp: " . json_encode($resp) . "\n";
+        } else {
+            echo "[dryRun] Simulo BUY qty={$qty}\n";
+        }
+    } elseif ($sellSignal) {
+        echo "Ejecutando orden MARKET SELL qty={$qty}\n";
+        if (!$dryRun) {
+            $resp = placeMarketOrder($symbol, 'SELL', $qty, false);
+            echo "Order resp: " . json_encode($resp) . "\n";
+        } else {
+            echo "[dryRun] Simulo SELL qty={$qty}\n";
+        }
+    }
+
+    echo "Fin del script.\n";
+
+} catch (Exception $e) {
+    echo "ERROR: " . $e->getMessage() . "\n";
+    exit(1);
+}
