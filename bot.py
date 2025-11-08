@@ -1,78 +1,130 @@
-<?php
-require 'vendor/autoload.php';
+import os
+import time
+from binance.client import Client
+import numpy as np
 
-use Binance\API;
+# =========================================
+# CONFIGURACIÓN
+# =========================================
+API_KEY = os.getenv("BINANCE_API_KEY")
+API_SECRET = os.getenv("BINANCE_API_SECRET")
+SYMBOL = os.getenv("SYMBOL", "AIAUSDT")
+LEVERAGE = int(os.getenv("LEVERAGE", 10))
+SLEEP_SECONDS = int(os.getenv("SLEEP_SECONDS", 60))
 
-// ========================
-// CONFIGURACIÓN
-// ========================
-$apiKey = getenv('BINANCE_API_KEY');
-$apiSecret = getenv('BINANCE_API_SECRET');
-$symbol = getenv('SYMBOL') ?: 'AIAUSDT';
-$leverage = getenv('LEVERAGE') ?: 10;
+client = Client(API_KEY, API_SECRET)
+client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
 
-$api = new Binance\API($apiKey, $apiSecret);
-$api->useServerTime();
+# =========================================
+# PARÁMETROS DE OPERACIÓN
+# =========================================
+AMOUNT = 1                # USD por operación
+STOP_LOSS_PCT = 0.35      # 35%
+TAKE_PROFIT_PCT = 0.60    # 60%
 
-// ========================
-// PARÁMETROS DE OPERACIÓN
-// ========================
-$amount = 1;              // USD por operación
-$stopLossPct = 0.35;      // 35%
-$takeProfitPct = 0.60;    // 60%
-$sleepSeconds = getenv('SLEEP_SECONDS') ?: 60;
+print(f"🚀 Bot iniciado en {SYMBOL} con apalancamiento {LEVERAGE}x")
 
-// ========================
-// FUNCIÓN PRINCIPAL
-// ========================
-while (true) {
-    $positions = $api->futuresPositionRisk();
-    $openPosition = array_filter($positions, fn($p) => $p['symbol'] === $symbol && abs(floatval($p['positionAmt'])) > 0);
+# =========================================
+# FUNCIONES AUXILIARES
+# =========================================
+def get_klines(symbol, interval="1m", limit=50):
+    data = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
+    closes = np.array([float(k[4]) for k in data])
+    return closes
 
-    // Si hay una operación abierta, esperamos
-    if (!empty($openPosition)) {
-        echo "⏸ Ya hay una operación abierta. Esperando...\n";
-        sleep($sleepSeconds);
-        continue;
-    }
+def ema(values, period):
+    return np.convolve(values, np.ones(period)/period, mode='valid')
 
-    // Obtener precios y medias
-    $candles = $api->futuresCandlesticks($symbol, '1m', 50);
-    $closes = array_column($candles, 4);
+def rsi(values, period=14):
+    deltas = np.diff(values)
+    seed = deltas[:period]
+    up = seed[seed >= 0].sum() / period
+    down = -seed[seed < 0].sum() / period
+    rs = up / down if down != 0 else 0
+    rsi_series = np.zeros_like(values)
+    rsi_series[:period] = 100. - 100. / (1. + rs)
 
-    $ema9 = trader_ema($closes, 9);
-    $ema21 = trader_ema($closes, 21);
-    $rsi = trader_rsi($closes, 14);
+    for i in range(period, len(values)):
+        delta = deltas[i - 1]
+        upval = max(delta, 0)
+        downval = -min(delta, 0)
+        up = (up * (period - 1) + upval) / period
+        down = (down * (period - 1) + downval) / period
+        rs = up / down if down != 0 else 0
+        rsi_series[i] = 100. - 100. / (1. + rs)
+    return rsi_series
 
-    $emaFast = end($ema9);
-    $emaSlow = end($ema21);
-    $rsiNow = end($rsi);
+def get_open_position(symbol):
+    positions = client.futures_position_information()
+    for pos in positions:
+        if pos["symbol"] == symbol and float(pos["positionAmt"]) != 0:
+            return pos
+    return None
 
-    // Señales de compra/venta
-    $buySignal  = $emaFast > $emaSlow && $rsiNow < 30;
-    $sellSignal = $emaFast < $emaSlow && $rsiNow > 70;
+# =========================================
+# LOOP PRINCIPAL
+# =========================================
+while True:
+    try:
+        # Verifica si hay operación abierta
+        position = get_open_position(SYMBOL)
+        if position:
+            print("⏸ Operación abierta, esperando que se cierre...")
+            time.sleep(SLEEP_SECONDS)
+            continue
 
-    $price = floatval($api->futuresPrice($symbol)['price']);
-    $quantity = round(($amount * $leverage) / $price, 3);
+        closes = get_klines(SYMBOL)
+        ema_fast = ema(closes, 9)
+        ema_slow = ema(closes, 21)
+        rsi_values = rsi(closes)
 
-    if ($buySignal) {
-        echo "🟢 Señal de COMPRA detectada a $price\n";
-        $api->futuresOrder('BUY', $symbol, $quantity, null, ['type' => 'MARKET']);
-        $tp = $price * (1 + $takeProfitPct);
-        $sl = $price * (1 - $stopLossPct);
-        $api->futuresOrder('SELL', $symbol, $quantity, $tp, ['type' => 'TAKE_PROFIT_MARKET', 'stopPrice' => $tp]);
-        $api->futuresOrder('SELL', $symbol, $quantity, $sl, ['type' => 'STOP_MARKET', 'stopPrice' => $sl]);
-    }
+        ema_fast_val = ema_fast[-1]
+        ema_slow_val = ema_slow[-1]
+        rsi_now = rsi_values[-1]
 
-    if ($sellSignal) {
-        echo "🔴 Señal de VENTA detectada a $price\n";
-        $api->futuresOrder('SELL', $symbol, $quantity, null, ['type' => 'MARKET']);
-        $tp = $price * (1 - $takeProfitPct);
-        $sl = $price * (1 + $stopLossPct);
-        $api->futuresOrder('BUY', $symbol, $quantity, $tp, ['type' => 'TAKE_PROFIT_MARKET', 'stopPrice' => $tp]);
-        $api->futuresOrder('BUY', $symbol, $quantity, $sl, ['type' => 'STOP_MARKET', 'stopPrice' => $sl]);
-    }
+        buy_signal = ema_fast_val > ema_slow_val and rsi_now < 30
+        sell_signal = ema_fast_val < ema_slow_val and rsi_now > 70
 
-    sleep($sleepSeconds);
-}
+        ticker = client.futures_symbol_ticker(symbol=SYMBOL)
+        price = float(ticker["price"])
+        quantity = round((AMOUNT * LEVERAGE) / price, 3)
 
+        if buy_signal:
+            print(f"🟢 Señal de COMPRA detectada a {price}")
+            client.futures_create_order(symbol=SYMBOL, side="BUY", type="MARKET", quantity=quantity)
+
+            tp = round(price * (1 + TAKE_PROFIT_PCT), 4)
+            sl = round(price * (1 - STOP_LOSS_PCT), 4)
+
+            client.futures_create_order(
+                symbol=SYMBOL, side="SELL", type="TAKE_PROFIT_MARKET",
+                stopPrice=tp, closePosition=True
+            )
+            client.futures_create_order(
+                symbol=SYMBOL, side="SELL", type="STOP_MARKET",
+                stopPrice=sl, closePosition=True
+            )
+            print(f"📈 TP en {tp} | 🛑 SL en {sl}")
+
+        elif sell_signal:
+            print(f"🔴 Señal de VENTA detectada a {price}")
+            client.futures_create_order(symbol=SYMBOL, side="SELL", type="MARKET", quantity=quantity)
+
+            tp = round(price * (1 - TAKE_PROFIT_PCT), 4)
+            sl = round(price * (1 + STOP_LOSS_PCT), 4)
+
+            client.futures_create_order(
+                symbol=SYMBOL, side="BUY", type="TAKE_PROFIT_MARKET",
+                stopPrice=tp, closePosition=True
+            )
+            client.futures_create_order(
+                symbol=SYMBOL, side="BUY", type="STOP_MARKET",
+                stopPrice=sl, closePosition=True
+            )
+            print(f"📉 TP en {tp} | 🛑 SL en {sl}")
+
+        time.sleep(SLEEP_SECONDS)
+
+    except Exception as e:
+        print(f"⚠️ Error: {e}")
+        time.sleep(SLEEP_SECONDS)
