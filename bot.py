@@ -1,160 +1,142 @@
 import time
-import pandas as pd
-import numpy as np
-from binance.client import Client
-from binance.enums import *
-from binance.exceptions import BinanceAPIException
+import ccxt
 
-# =========================
-# CONFIGURACIÓN
-# =========================
+# ============================================
+# CONFIGURACIÓN GENERAL
+# ============================================
+
 API_KEY = "TU_API_KEY"
 API_SECRET = "TU_API_SECRET"
-SIMBOLO = "BTCUSDT"
-INTERVALO = "1m"
-CANTIDAD = 0.001
-APALANCAMIENTO = 10
-SLEEP_SECONDS = 60  # segundos entre análisis
-client = Client(API_KEY, API_SECRET)
+EXCHANGE = "binanceusdm"  # o "bybit", "okx", etc.
+SYMBOL = "BTC/USDT"
+TIMEFRAME = "5m"
+LEVERAGE = 10
+RISK_PERCENT = 0.25  # 25% Take Profit
+SLEEP_TIME = 60 * 5  # Cada 5 minutos
 
-# =========================
-# FUNCIONES TÉCNICAS
-# =========================
+# ============================================
+# CONEXIÓN CON EL EXCHANGE
+# ============================================
 
-def obtener_datos():
-    """Descarga las últimas velas de Binance Futures"""
-    klines = client.futures_klines(symbol=SIMBOLO, interval=INTERVALO, limit=200)
-    df = pd.DataFrame(klines, columns=[
-        "timestamp", "open", "high", "low", "close", "volume",
-        "close_time", "quote_asset_volume", "number_of_trades",
-        "taker_buy_base_asset_volume", "taker_buy_quote_asset_volume", "ignore"
-    ])
-    df["open"] = df["open"].astype(float)
-    df["high"] = df["high"].astype(float)
-    df["low"] = df["low"].astype(float)
-    df["close"] = df["close"].astype(float)
-    return df
+exchange = getattr(ccxt, EXCHANGE)({
+    "apiKey": API_KEY,
+    "secret": API_SECRET,
+    "enableRateLimit": True
+})
+exchange.load_markets()
+print(f"Conectado a {EXCHANGE} con símbolo {SYMBOL}")
 
+# ============================================
+# FUNCIONES AUXILIARES
+# ============================================
 
-def ema(data, period):
-    return data.ewm(span=period, adjust=False).mean()
+def get_candles(symbol, timeframe, limit=100):
+    candles = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    return candles
 
-def sma(data, period):
-    return data.rolling(period).mean()
-
-def atr(df, length=10):
-    high_low = df["high"] - df["low"]
-    high_close = abs(df["high"] - df["close"].shift())
-    low_close = abs(df["low"] - df["close"].shift())
-    ranges = pd.concat([high_low, high_close, low_close], axis=1)
-    true_range = ranges.max(axis=1)
-    return true_range.rolling(length).mean()
-
-def supertrend(df, length=10, multiplier=4.0):
-    atr_val = atr(df, length)
-    hl2 = (df["high"] + df["low"]) / 2
-    upper_band = hl2 + (multiplier * atr_val)
-    lower_band = hl2 - (multiplier * atr_val)
-    final_upper_band = upper_band.copy()
-    final_lower_band = lower_band.copy()
-
-    direction = [True] * len(df)
-    for i in range(1, len(df)):
-        if df["close"][i] > final_upper_band[i - 1]:
-            direction[i] = True
-        elif df["close"][i] < final_lower_band[i - 1]:
-            direction[i] = False
+def ema(values, length):
+    k = 2 / (length + 1)
+    ema_val = []
+    for i, val in enumerate(values):
+        if i == 0:
+            ema_val.append(val)
         else:
-            direction[i] = direction[i - 1]
-            if direction[i] and final_lower_band[i] < final_lower_band[i - 1]:
-                final_lower_band[i] = final_lower_band[i - 1]
-            if not direction[i] and final_upper_band[i] > final_upper_band[i - 1]:
-                final_upper_band[i] = final_upper_band[i - 1]
-    supertrend = np.where(direction, final_lower_band, final_upper_band)
-    return supertrend, direction
+            ema_val.append(val * k + ema_val[-1] * (1 - k))
+    return ema_val
 
+def rsi(values, length=14):
+    gains, losses = [], []
+    for i in range(1, len(values)):
+        diff = values[i] - values[i - 1]
+        if diff >= 0:
+            gains.append(diff)
+            losses.append(0)
+        else:
+            gains.append(0)
+            losses.append(abs(diff))
+    avg_gain = sum(gains[:length]) / length
+    avg_loss = sum(losses[:length]) / length
+    rs = avg_gain / avg_loss if avg_loss != 0 else 0
+    rsi_list = [100 - (100 / (1 + rs))]
+    for i in range(length, len(values)):
+        avg_gain = (avg_gain * (length - 1) + gains[i]) / length
+        avg_loss = (avg_loss * (length - 1) + losses[i]) / length
+        rs = avg_gain / avg_loss if avg_loss != 0 else 0
+        rsi_list.append(100 - (100 / (1 + rs)))
+    return [None] * (len(values) - len(rsi_list)) + rsi_list
 
-def obtener_posicion_actual():
-    posiciones = client.futures_position_information(symbol=SIMBOLO)
-    for p in posiciones:
-        if float(p["positionAmt"]) != 0:
-            return float(p["positionAmt"])
-    return 0
+# ============================================
+# LÓGICA DE SEÑALES
+# ============================================
 
+def check_signals():
+    candles = get_candles(SYMBOL, TIMEFRAME, 100)
+    closes = [c[4] for c in candles]
 
-def ejecutar_orden(direccion):
-    try:
-        if direccion == "BUY":
-            print("🚀 Ejecutando orden de COMPRA...")
-            client.futures_create_order(
-                symbol=SIMBOLO,
-                side=SIDE_BUY,
-                type=ORDER_TYPE_MARKET,
-                quantity=CANTIDAD
-            )
-        elif direccion == "SELL":
-            print("💣 Ejecutando orden de VENTA...")
-            client.futures_create_order(
-                symbol=SIMBOLO,
-                side=SIDE_SELL,
-                type=ORDER_TYPE_MARKET,
-                quantity=CANTIDAD
-            )
-        print("✅ Orden ejecutada correctamente.")
-    except BinanceAPIException as e:
-        print(f"❌ Error al ejecutar orden: {e.message}")
+    ema_fast = ema(closes, 9)
+    ema_slow = ema(closes, 21)
+    rsi_vals = rsi(closes, 14)
 
+    last_close = closes[-1]
+    last_ema_fast = ema_fast[-1]
+    last_ema_slow = ema_slow[-1]
+    last_rsi = rsi_vals[-1]
 
-# =========================
+    buy_signal = (last_ema_fast > last_ema_slow and last_rsi < 60)
+    sell_signal = (last_ema_fast < last_ema_slow and last_rsi > 40)
+
+    return buy_signal, sell_signal, last_close
+
+# ============================================
+# EJECUCIÓN DE ÓRDENES
+# ============================================
+
+def get_position():
+    positions = exchange.fetch_positions([SYMBOL])
+    for p in positions:
+        if float(p["contracts"]) > 0:
+            return p
+    return None
+
+def close_position(position):
+    side = "sell" if position["side"] == "long" else "buy"
+    amount = abs(float(position["contracts"]))
+    print(f"Cerrando posición {position['side']} de {amount} contratos")
+    exchange.create_market_order(SYMBOL, side, amount)
+
+def open_position(side, amount, price):
+    tp_price = price * (1 + RISK_PERCENT) if side == "buy" else price * (1 - RISK_PERCENT)
+    print(f"Abrir {side.upper()} - Precio: {price}, TP: {tp_price}")
+    order = exchange.create_market_order(SYMBOL, side, amount)
+    exchange.create_order(SYMBOL, "take_profit_market", 
+                          "sell" if side == "buy" else "buy", 
+                          amount, 
+                          tp_price, 
+                          {"reduceOnly": True})
+    return order
+
+# ============================================
 # LOOP PRINCIPAL
-# =========================
-print("🤖 Iniciando bot EMA+SuperTrend+NovaWave...")
+# ============================================
 
 while True:
     try:
-        df = obtener_datos()
-        close = df["close"]
+        buy_signal, sell_signal, last_price = check_signals()
+        position = get_position()
 
-        # --- EMAs ---
-        ema9 = ema(close, 9)
-        ema21 = ema(close, 21)
-        ema50 = ema(close, 50)
-        ema100 = ema(close, 100)
-        ema200 = ema(close, 200)
+        if buy_signal and (not position or position["side"] == "short"):
+            if position:
+                close_position(position)
+            open_position("buy", 0.001, last_price)
 
-        # --- Supertrend ---
-        st, direction = supertrend(df, 10, 4.0)
+        elif sell_signal and (not position or position["side"] == "long"):
+            if position:
+                close_position(position)
+            open_position("sell", 0.001, last_price)
 
-        # --- NovaWave ---
-        nw_fast = ema(close, 9)
-        nw_slow = ema(close, 21)
-        nw_signal = sma(close, 10)
-        nw_bull = nw_fast > nw_slow
-
-        # --- Señales ---
-        buy_signal = (nw_fast.iloc[-2] < nw_slow.iloc[-2]) and (nw_fast.iloc[-1] > nw_slow.iloc[-1])
-        sell_signal = (nw_fast.iloc[-2] > nw_slow.iloc[-2]) and (nw_fast.iloc[-1] < nw_slow.iloc[-1])
-
-        print("📊 Analizando mercado...")
-        print(f"EMA9: {ema9.iloc[-1]:.2f}, EMA21: {ema21.iloc[-1]:.2f}, ST: {st[-1]:.2f}, NovaBull: {nw_bull.iloc[-1]}")
-        print(f"Signal: BUY={buy_signal}, SELL={sell_signal}")
-
-        posicion = obtener_posicion_actual()
-
-        if posicion == 0:
-            if buy_signal:
-                ejecutar_orden("BUY")
-            elif sell_signal:
-                ejecutar_orden("SELL")
-            else:
-                print("⏸️ Sin señal clara.")
-        else:
-            print("⚙️ Ya hay una posición abierta, esperando cierre manual o TP/SL...")
-
-        print("⏳ Esperando próximo ciclo...\n")
-        time.sleep(SLEEP_SECONDS)
+        print(f"[{time.strftime('%H:%M:%S')}] Señales -> Buy: {buy_signal}, Sell: {sell_signal}")
+        time.sleep(SLEEP_TIME)
 
     except Exception as e:
-        print(f"❌ Error general: {e}")
-        time.sleep(SLEEP_SECONDS)
-
+        print("Error:", e)
+        time.sleep(60)
